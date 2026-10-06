@@ -467,9 +467,52 @@ processes were also exercised on Windows:
 - Re-running `init` against an existing directory left its credentials unchanged.
 - The release executable passed a separate relayed byte-transfer smoke run.
 
-These are transport checks, not physical-device or Internet/NAT qualification.
-Neither `usbipd` nor `usbip.exe` was available on the verification machine's PATH.
+These automated checks are transport checks, not physical-device or Internet/NAT
+qualification. A separate manual Windows loopback test with an explicitly
+approved spare USB drive also passed: native attachment through the direct
+tunnel, a 16 MiB file write and flush, then an exact SHA-256 match after volume
+dismount/remount and readback. The test file was removed and the original device
+mount, sharing, and firewall state restored. This does not qualify physical
+relay attachment, YubiKey functions, or cross-machine Internet operation.
 Follow the driver setup and discovery/attach steps above to qualify your device.
+
+## Opt-in real-drive integration test
+
+[`crates/remoteusb-cli/tests/usb-drive.rs`](crates/remoteusb-cli/tests/usb-drive.rs)
+accepts a drive letter (`D`, `D:`, or `D:\`), a Windows volume GUID path such as
+`\\?\Volume{12345678-1234-1234-1234-123456789abc}\`, or an absolute mounted-directory
+path through `REMOTEUSB_TEST_DRIVE`. Select the **receiving-side volume already
+attached through remoteusb**, not the original locally attached exporter volume.
+Check `usbip.exe port` and the selected volume before running it.
+
+```powershell
+$env:REMOTEUSB_TEST_DRIVE = 'D:'
+cargo +1.99.0 test --locked -p remoteusb-cli --test usb-drive -- --ignored --nocapture
+Remove-Item Env:REMOTEUSB_TEST_DRIVE
+```
+
+On Linux, use the receiver's mounted path:
+
+```sh
+REMOTEUSB_TEST_DRIVE=/media/remote-usb cargo +1.99.0 test --locked -p remoteusb-cli --test usb-drive -- --ignored --nocapture
+```
+
+The test creates a uniquely named temporary directory on that drive, writes and
+flushes 16 MiB, closes/reopens the file, and compares every byte. It then overwrites
+one interior block, flushes/reopens again, and verifies the changed block,
+neighbors, first/last blocks, and unchanged file length. Only its own directory
+and file are deleted; existing files are never opened or overwritten.
+
+The hardware case is ignored by default and fails if no target is supplied.
+It does not install drivers, bind/attach devices, change mounts or firewalls, or
+start/stop the tunnel. The operator establishes which tunnel/path backs the volume;
+the test cannot infer that from a drive letter. Reads can use OS caches, so this
+is filesystem I/O verification, not proof of power-loss durability.
+
+This Rust hardware case passed on Windows against the approved spare USB drive
+mounted through a local direct remoteusb tunnel. Its test file was removed and
+the operator restored the original mount/sharing state after the run. The same
+test has not yet qualified a physical drive over relay or an Internet path.
 
 ## Security, shutdown, and troubleshooting
 
