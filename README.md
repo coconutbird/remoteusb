@@ -12,6 +12,31 @@ There is no insecure mode or legacy direct-TLS endpoint configuration.
 
 For a Windows-to-Windows YubiKey connection, follow these steps in order:
 
+### Downloads to install first
+
+Choose **x64** for Intel/AMD Windows PCs, or **ARM64** for Windows on ARM.
+These links point to official releases; choose the installer asset for your architecture.
+
+| Install on | Required download | What it provides |
+| --- | --- | --- |
+| PC holding the physical USB device | [Download usbipd-win](https://github.com/dorssel/usbipd-win/releases/latest) — choose the x64 or ARM64 `.msi` | USB exporter driver/service and `usbipd` command |
+| PC receiving the remote USB device | [Download usbip-win2](https://github.com/vadimgrn/usbip-win2/releases/latest) — choose the x64 or ARM64 installer `.exe` | Virtual USB host-controller driver and `usbip.exe` |
+| Machine building remoteusb only | [Rust installer (rustup)](https://rustup.rs/) and [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) | Rust compiler plus Windows C++ linker/SDK; select **Desktop development with C++** |
+
+The rendezvous-only host needs **neither USB driver**. Runtime endpoints do not
+need Rust or Build Tools if you copy the built `remoteusb.exe` to them.
+remoteusb itself is currently [built from this checkout](#build-and-prerequisites);
+there is no remoteusb installer download provided by this guide.
+
+Install only the driver needed for each role. Review the linked release notes and
+installer prompts: receiving-driver installation can restart USB hubs, and
+usbipd-win installs a firewall rule that must be restricted before sharing devices.
+Do not disable Secure Boot or driver-signature enforcement. Review the
+[usbip-win2 release notes and known issues](https://github.com/vadimgrn/usbip-win2/releases/latest)
+before installing; a listed release is not a hardware-compatibility certification.
+
+### Setup order
+
 1. [Build remoteusb](#build-and-prerequisites), using the required local Groupnet
    checkout, and install the USB/IP driver/tool for each machine's role.
 2. [Generate credentials once](#generate-credentials-once) in a protected directory.
@@ -152,9 +177,10 @@ winget install --exact --id dorssel.usbipd-win --source winget
 winget install --exact --id vadimgrn.usbip-win2 --source winget
 ```
 
-The [winget receiving-driver manifest](https://github.com/microsoft/winget-pkgs/blob/master/manifests/v/vadimgrn/usbip-win2/0.9.7.8/vadimgrn.usbip-win2.installer.yaml)
-documents machine-wide installation/elevation and supported architectures. These
-are **manual, opted-in system actions**, never part of proxy startup. Do not
+If using winget instead of the download links, check the offered version with
+`winget show --exact --id vadimgrn.usbip-win2 --source winget` and compare it with
+the upstream release notes; package feeds can lag. Driver installation is a
+**manual, opted-in system action**, never part of proxy startup. Do not
 install/restart drivers during critical USB work. Binding/attaching and firewall
 policy may require administrator/root rights; remoteusb itself can run as an
 ordinary account with access to its keys and unprivileged sockets.
