@@ -1,0 +1,21 @@
+[package]
+name = "remoteusb-transport"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Pinned Groupnet ordered-stream transport for existing USB/IP stacks"
+
+[dependencies]
+tokio.workspace = true
+rustls.workspace = true
+groupnet.workspace = true
+tokio-util.workspace = true
+rustls-pemfile.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

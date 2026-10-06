@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: coconutbird/remoteusb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: coconutbird/remoteusb
+      - name: Check out the matching Groupnet transport
+        uses: actions/checkout@v4
+        with:
+          repository: napbat/groupnet
+          ref: 82b8595a5e196327d9e1b760dfd43979f932461e
+          path: napbat/groupnet
+          token: ${{ secrets.GROUPNET_READ_TOKEN || github.token }}
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal --component clippy,rustfmt
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: Build binary
+        run: cargo build --release --locked -p remoteusb-cli
+      - name: CLI smoke
+        run: cargo run --locked -p remoteusb-cli -- --help

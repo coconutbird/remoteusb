@@ -1,0 +1,25 @@
+[package]
+name = "remoteusb-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "remoteusb"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+getrandom.workspace = true
+rcgen.workspace = true
+remoteusb-transport.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

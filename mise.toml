@@ -1,0 +1,15 @@
+[tasks.fmt]
+description = "Verify the workspace is rustfmt-clean"
+run = "cargo fmt --all -- --check"
+
+[tasks.check]
+description = "Clippy gate: pedantic, warnings are errors"
+run = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+
+[tasks.test]
+description = "Workspace test suite"
+run = "cargo test --workspace --locked"
+
+[tasks.ci]
+description = "Run formatting, lint, and test gates in order"
+run = ["mise run fmt", "mise run check", "mise run test"]
