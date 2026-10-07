@@ -20,6 +20,8 @@ use tokio::net::TcpListener;
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{oneshot, watch};
 
+use crate::usbip::BusId;
+
 pub(super) use supervisor::supervise;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -31,19 +33,19 @@ const MAX_MESSAGE: usize = 2048;
 type SupervisorMessages = Messages<BufReader<ChildStdout>>;
 
 pub(super) struct Attachment {
-    busid: String,
+    busid: BusId,
     executable: PathBuf,
 }
 
 impl Attachment {
-    pub(super) fn new(busid: String, executable: Option<PathBuf>) -> io::Result<Self> {
+    pub(super) fn new(busid: BusId, executable: Option<PathBuf>) -> io::Result<Self> {
         if !cfg!(windows) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "attachment requires Windows usbip-win2; attach manually on other systems",
             ));
         }
-        validate_busid(&busid)?;
+        let busid = client_busid(busid.as_str())?;
         let executable = executable
             .or_else(|| {
                 std::env::var_os("ProgramFiles")
@@ -374,19 +376,21 @@ fn cleanup_message(message: &str) -> io::Result<()> {
     }
 }
 
-fn validate_busid(busid: &str) -> io::Result<()> {
-    if busid.is_empty()
-        || busid.len() > 31
-        || !busid
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'-' || byte == b'.')
+/// usbip-win2 receives the BUSID as a command-line value and echoes it in
+/// `port` URIs, so the importer accepts only the numeric Linux form (ASCII
+/// digits, `-` and `.`) of the wire grammar.
+fn client_busid(busid: &str) -> io::Result<BusId> {
+    if busid
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'.'))
+        && let Ok(busid) = busid.parse()
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid USB/IP BUSID",
-        ));
+        return Ok(busid);
     }
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "invalid USB/IP BUSID",
+    ))
 }
 
 fn port(output: &[u8]) -> io::Result<u8> {
@@ -408,7 +412,7 @@ fn independent_process(command: &mut Command) {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MESSAGE, Messages, attachment_message, cleanup_message, port, validate_busid,
+        MAX_MESSAGE, Messages, attachment_message, cleanup_message, client_busid, port,
         wait_for_no_streams,
     };
     use tokio::io::{AsyncWriteExt, BufReader};
@@ -443,7 +447,7 @@ mod tests {
     #[test]
     fn busid_never_becomes_an_option_or_shell_fragment() {
         for busid in ["1-2", "3-4.5"] {
-            assert!(validate_busid(busid).is_ok());
+            assert_eq!(client_busid(busid).unwrap().as_str(), busid);
         }
         for busid in [
             "",
@@ -453,7 +457,7 @@ mod tests {
             "é",
             "12345678901234567890123456789012",
         ] {
-            assert!(validate_busid(busid).is_err());
+            assert!(client_busid(busid).is_err());
         }
     }
 

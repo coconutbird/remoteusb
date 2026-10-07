@@ -1,11 +1,13 @@
 use std::collections::BTreeSet;
+use std::fs::File;
 use std::io;
 
 use serde::Deserialize;
 
 use crate::inventory::Device;
+use crate::usbip::BusId;
 
-use super::{BindError, command};
+use super::{BindError, DeviceHost, Lease, command, lock};
 
 // usbipd-win's DeviceExtensions.GetAll excludes USB hubs and monitor stubs.
 // State also contains disconnected persisted entries, which are retained here
@@ -20,7 +22,7 @@ struct State {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct Record {
-    bus_id: Option<String>,
+    bus_id: Option<ReportedBusId>,
     instance_id: String,
     description: String,
     persisted_guid: Option<String>,
@@ -31,11 +33,33 @@ struct Record {
     is_forced: bool,
 }
 
+/// usbipd's `BusId` text. Only records with a USB hardware ID must carry a
+/// valid BUSID ([`parse_state`] rejects the rest); other records may report
+/// arbitrary text, kept as `Invalid`, which never equals a BUSID.
+#[derive(Debug, Deserialize)]
+#[serde(from = "String")]
+enum ReportedBusId {
+    Valid(BusId),
+    Invalid,
+}
+
+impl From<String> for ReportedBusId {
+    fn from(text: String) -> Self {
+        text.parse().map_or(Self::Invalid, Self::Valid)
+    }
+}
+
 impl Record {
+    fn busid(&self) -> Option<BusId> {
+        match self.bus_id {
+            Some(ReportedBusId::Valid(busid)) => Some(busid),
+            Some(ReportedBusId::Invalid) | None => None,
+        }
+    }
+
     fn available(&self) -> bool {
-        self.bus_id
-            .as_deref()
-            .is_some_and(|busid| busid != "IncompatibleHub" && busid != "0-0")
+        self.busid()
+            .is_some_and(|busid| !matches!(busid.as_str(), "IncompatibleHub" | "0-0"))
             && hardware_id(&self.instance_id).is_some()
     }
 
@@ -48,24 +72,81 @@ impl Record {
     }
 }
 
-pub(super) struct Candidate {
-    instance: String,
-}
+/// usbipd-win sharing control.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::exporter) struct WindowsHost;
 
-impl Candidate {
-    pub(super) fn identity(&self) -> &str {
-        &self.instance
+impl DeviceHost for WindowsHost {
+    type Lease = WindowsLease;
+
+    fn new() -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn inventory(&self) -> io::Result<Vec<Device>> {
+        let mut devices = Vec::new();
+        for record in state().await? {
+            if !record.available() {
+                continue;
+            }
+            let (Some(busid), Some((vendor, product))) =
+                (record.busid(), hardware_id(&record.instance_id))
+            else {
+                continue;
+            };
+            devices.push(Device {
+                busid,
+                vendor,
+                product,
+                name: super::device_name(&record.description),
+                shared: record.persisted_guid.is_some(),
+                busy: record.busy(),
+            });
+        }
+        devices.sort_by_key(|device| device.busid);
+        Ok(devices)
+    }
+
+    async fn bind(&self, busid: BusId) -> Result<WindowsLease, BindError> {
+        let instance = candidate(busid).await?;
+        let lock = lock::acquire(busid).await?;
+        let identity_lock = lock::acquire_identity(&instance).await?;
+        // On failure, locals drop in reverse order: `identity_lock`, then
+        // `lock`, both after `share` finished any partial-bind cleanup.
+        let sharing = share(busid, &instance).await?;
+        Ok(WindowsLease {
+            sharing,
+            lock,
+            identity_lock,
+        })
     }
 }
 
-pub(super) async fn candidate(busid: &str) -> io::Result<Candidate> {
+/// A bound device and its ownership locks. Field order is drop order, so an
+/// unrestored lease releases `lock` before `identity_lock`, as `restore` does.
+pub(in crate::exporter) struct WindowsLease {
+    sharing: Sharing,
+    lock: File,
+    identity_lock: File,
+}
+
+impl Lease for WindowsLease {
+    async fn restore(self) -> io::Result<()> {
+        let result = self.sharing.restore().await;
+        // Ownership ends only after cleanup: BUSID lock, then identity lock.
+        drop(self.lock);
+        drop(self.identity_lock);
+        result
+    }
+}
+
+/// Instance identity of the exportable device currently at `busid`.
+async fn candidate(busid: BusId) -> io::Result<String> {
     state()
         .await?
         .into_iter()
-        .find(|record| record.available() && record.bus_id.as_deref() == Some(busid))
-        .map(|record| Candidate {
-            instance: record.instance_id,
-        })
+        .find(|record| record.available() && record.busid() == Some(busid))
+        .map(|record| record.instance_id)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -74,13 +155,13 @@ pub(super) async fn candidate(busid: &str) -> io::Result<Candidate> {
         })
 }
 
-pub(super) struct Lease {
+struct Sharing {
     // None means the sharing existed before this session. Never unbind it.
     owned: Option<(String, String)>,
 }
 
-impl Lease {
-    pub(super) async fn restore(self) -> io::Result<()> {
+impl Sharing {
+    async fn restore(self) -> io::Result<()> {
         let Some((instance, guid)) = self.owned else {
             return Ok(());
         };
@@ -122,42 +203,19 @@ impl Lease {
     }
 }
 
-pub(super) async fn inventory() -> io::Result<Vec<Device>> {
-    let mut devices = Vec::new();
-    for record in state().await? {
-        if !record.available() {
-            continue;
-        }
-        let (Some(busid), Some((vendor, product))) =
-            (record.bus_id.as_ref(), hardware_id(&record.instance_id))
-        else {
-            continue;
-        };
-        devices.push(Device {
-            busid: busid.clone(),
-            vendor,
-            product,
-            name: super::device_name(&record.description),
-            shared: record.persisted_guid.is_some(),
-            busy: record.busy(),
-        });
-    }
-    devices.sort_by(|left, right| left.busid.cmp(&right.busid));
-    Ok(devices)
-}
-
-pub(super) async fn bind(busid: &str, candidate: Candidate) -> Result<Lease, BindError> {
+/// Share `busid` if `instance` still occupies it; the caller holds both locks.
+async fn share(busid: BusId, instance: &str) -> Result<Sharing, BindError> {
     let before = state().await?;
     let selected = before
         .iter()
-        .find(|record| record.available() && record.bus_id.as_deref() == Some(busid))
+        .find(|record| record.available() && record.busid() == Some(busid))
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("USB BUSID {busid} is no longer connected or exportable"),
             )
         })?;
-    if !selected.same_identity(&candidate.instance) {
+    if !selected.same_identity(instance) {
         return Err(io::Error::other(format!(
             "USB {busid} identity changed while acquiring its ownership lock"
         ))
@@ -171,12 +229,13 @@ pub(super) async fn bind(busid: &str, candidate: Candidate) -> Result<Lease, Bin
         .into());
     }
     if selected.persisted_guid.is_some() {
-        return Ok(Lease { owned: None });
+        return Ok(Sharing { owned: None });
     }
     if selected.is_forced {
         return Err(io::Error::new(io::ErrorKind::Unsupported, format!("USB {busid} has a preexisting forced driver without a sharing GUID; normal usbipd bind would change that driver, so restore its driver manually first")).into());
     }
-    let result = command::run_with_stderr("usbipd", &["bind", "--busid", busid], &[]).await;
+    let result =
+        command::run_with_stderr("usbipd", &["bind", "--busid", busid.as_str()], &[]).await;
     if result
         .as_ref()
         .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
@@ -197,11 +256,9 @@ pub(super) async fn bind(busid: &str, candidate: Candidate) -> Result<Lease, Bin
         // usbipd explicitly reports a no-op: another owner shared the device
         // after our snapshot. Preserve that binding even though its GUID is new.
         if current.is_some_and(|record| {
-            record.bus_id.as_deref() == Some(busid)
-                && record.persisted_guid.is_some()
-                && !record.busy()
+            record.busid() == Some(busid) && record.persisted_guid.is_some() && !record.busy()
         }) {
-            return Ok(Lease { owned: None });
+            return Ok(Sharing { owned: None });
         }
         return Err(io::Error::other(
             "device changed during an idempotent usbipd bind; sharing was not claimed",
@@ -221,7 +278,7 @@ pub(super) async fn bind(busid: &str, candidate: Candidate) -> Result<Lease, Bin
     let owned =
         newly_owned(&before, &after, &selected.instance_id).map_err(BindError::unreconciled)?;
     if after.iter().any(|record| {
-        record.bus_id.as_deref() == Some(busid)
+        record.busid() == Some(busid)
             && !record.same_identity(&selected.instance_id)
             && record.persisted_guid.as_ref().is_some_and(|guid| {
                 !before
@@ -231,7 +288,7 @@ pub(super) async fn bind(busid: &str, candidate: Candidate) -> Result<Lease, Bin
     }) {
         // BUSID-only bind cannot atomically guard against hotplug. Do not guess
         // ownership of a replacement's GUID or continue offering this BUSID.
-        let cleanup = Lease { owned }.restore().await;
+        let cleanup = Sharing { owned }.restore().await;
         return Err(BindError::unreconciled(io::Error::other(format!(
             "BUSID {busid} was reused during bind and the replacement has new sharing; inspect usbipd state manually; original-instance cleanup: {cleanup:?}"
         ))));
@@ -240,18 +297,18 @@ pub(super) async fn bind(busid: &str, candidate: Candidate) -> Result<Lease, Bin
         .iter()
         .find(|record| record.same_identity(&selected.instance_id));
     let valid = current.is_some_and(|record| {
-        record.bus_id.as_deref() == Some(busid) && record.persisted_guid.is_some() && !record.busy()
+        record.busid() == Some(busid) && record.persisted_guid.is_some() && !record.busy()
     });
-    let lease = Lease { owned };
-    if result.is_ok() && valid && lease.owned.is_some() {
-        return Ok(lease);
+    let sharing = Sharing { owned };
+    if result.is_ok() && valid && sharing.owned.is_some() {
+        return Ok(sharing);
     }
     let error = result.err().unwrap_or_else(|| {
         io::Error::other(format!(
             "USB identity/sharing changed while binding {busid}; refusing import"
         ))
     });
-    match lease.restore().await {
+    match sharing.restore().await {
         Ok(()) => Err(error.into()),
         Err(cleanup) => Err(BindError::unreconciled(io::Error::other(format!(
             "{error}; partial bind cleanup failed: {cleanup}"
@@ -263,10 +320,10 @@ fn failed_bind_changed_target(
     before: &[Record],
     after: &[Record],
     instance: &str,
-    busid: &str,
+    busid: BusId,
 ) -> bool {
     after.iter().any(|record| {
-        (record.same_identity(instance) || record.bus_id.as_deref() == Some(busid))
+        (record.same_identity(instance) || record.busid() == Some(busid))
             && record.persisted_guid.as_ref().is_some_and(|guid| {
                 !before
                     .iter()
@@ -324,15 +381,21 @@ fn parse_state(bytes: &[u8]) -> io::Result<Vec<Record>> {
                 "usbipd state contains empty/duplicate instance identities",
             ));
         }
-        if record.available() {
-            let busid = record.bus_id.as_deref().unwrap_or_default();
-            crate::inventory::validate_busid(busid)?;
-            if !busids.insert(busid) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "usbipd state contains duplicate BUSIDs",
-                ));
-            }
+        // Exactly the records that would be exportable with a valid BUSID
+        // (neither `IncompatibleHub` nor `0-0` is invalid) must carry one.
+        if matches!(record.bus_id, Some(ReportedBusId::Invalid))
+            && hardware_id(&record.instance_id).is_some()
+        {
+            return Err(crate::invalid_data("invalid USB BUSID"));
+        }
+        if let Some(busid) = record.busid()
+            && record.available()
+            && !busids.insert(busid)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "usbipd state contains duplicate BUSIDs",
+            ));
         }
         if let Some(guid) = &record.persisted_guid
             && (!valid_guid(guid) || !guids.insert(guid))
@@ -385,7 +448,7 @@ mod tests {
     const GUID: &str = "12345678-1234-1234-1234-123456789abc";
     fn record(busid: Option<&str>, instance: &str, guid: Option<&str>) -> Record {
         Record {
-            bus_id: busid.map(str::to_owned),
+            bus_id: busid.map(|busid| ReportedBusId::from(busid.to_owned())),
             instance_id: instance.to_owned(),
             description: "Device".to_owned(),
             persisted_guid: guid.map(str::to_owned),
@@ -441,21 +504,24 @@ mod tests {
             record(Some("1-2"), selected, None),
             record(Some("1-3"), unrelated, None),
         ];
+        let target: BusId = "1-2".parse().unwrap();
         let unrelated_change = vec![record(Some("1-3"), unrelated, Some(GUID))];
         assert!(!failed_bind_changed_target(
             &before,
             &unrelated_change,
             selected,
-            "1-2"
+            target
         ));
         let moved = vec![record(Some("1-4"), selected, Some(GUID))];
-        assert!(failed_bind_changed_target(&before, &moved, selected, "1-2"));
+        assert!(failed_bind_changed_target(
+            &before, &moved, selected, target
+        ));
         let replacement = vec![record(Some("1-2"), unrelated, Some(GUID))];
         assert!(failed_bind_changed_target(
             &before,
             &replacement,
             selected,
-            "1-2"
+            target
         ));
     }
 
@@ -477,5 +543,19 @@ mod tests {
         assert!(valid_guid(GUID));
         let json = br#"{"Devices":[{"BusId":"1-2","InstanceId":"USB\\VID_1234&PID_5678\\s","Description":"Device"},{"BusId":"1-2","InstanceId":"USB\\VID_1234&PID_5678\\other","Description":"Device"}]}"#;
         assert!(parse_state(json).is_err());
+    }
+
+    #[test]
+    fn only_exportable_records_require_valid_busids() {
+        let json = br#"{"Devices":[{"BusId":"1 2","InstanceId":"USB\\VID_1234&PID_5678\\s","Description":"Device"}]}"#;
+        assert_eq!(
+            parse_state(json).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let json =
+            br#"{"Devices":[{"BusId":"1 2","InstanceId":"ROOT\\HUB\\s","Description":"Hub"}]}"#;
+        let records = parse_state(json).unwrap();
+        assert!(!records[0].available());
+        assert_eq!(records[0].busid(), None);
     }
 }

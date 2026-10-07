@@ -1,17 +1,48 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
-pub(super) fn acquire(busid: &str) -> io::Result<File> {
-    crate::inventory::validate_busid(busid)?;
-    open_lock(&machine_directory()?, busid)
+use tokio::time::Instant;
+
+use crate::usbip::BusId;
+
+/// A just-released Linux `flock` stays held while any concurrently spawned
+/// child still has the duplicated descriptor between fork and `exec`
+/// (close-on-exec). The exporter spawns driver tools concurrently, so a lock
+/// released by a finished session can briefly look busy to the next one.
+const RELEASE_SETTLE: Duration = Duration::from_millis(250);
+const RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Retries only `ResourceBusy`, within a short bound, then reports it.
+async fn settle(open: impl Fn() -> io::Result<File>) -> io::Result<File> {
+    let deadline = Instant::now() + RELEASE_SETTLE;
+    loop {
+        match open() {
+            Err(error)
+                if error.kind() == io::ErrorKind::ResourceBusy && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(RETRY_INTERVAL).await;
+            }
+            result => return result,
+        }
+    }
 }
 
+/// Lock `busid` machine-wide until the returned file drops.
+pub(super) async fn acquire(busid: BusId) -> io::Result<File> {
+    let root = machine_directory()?;
+    settle(|| open_lock(&root, busid)).await
+}
+
+/// Lock one Windows device identity machine-wide until the returned file drops.
 #[cfg(windows)]
-pub(super) fn acquire_identity(instance: &str) -> io::Result<File> {
+pub(super) async fn acquire_identity(instance: &str) -> io::Result<File> {
     let root = identity_directory(&machine_directory()?, instance)?;
     fs::create_dir_all(&root)?;
-    open_lock(&root, "lease")
+    // `lease` is a valid BUSID, so parsing it cannot fail.
+    let lease = "lease".parse()?;
+    settle(|| open_lock(&root, lease)).await
 }
 
 #[cfg(windows)]
@@ -66,8 +97,9 @@ fn machine_directory() -> io::Result<std::path::PathBuf> {
     Ok(root)
 }
 
-fn open_lock(root: &Path, busid: &str) -> io::Result<File> {
-    crate::inventory::validate_busid(busid)?;
+// Only BUSIDs name lock files: their grammar excludes path separators and the
+// empty name, so a lock cannot escape `root`.
+fn open_lock(root: &Path, busid: BusId) -> io::Result<File> {
     if !fs::symlink_metadata(root)?.file_type().is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -117,39 +149,49 @@ fn open_lock(root: &Path, busid: &str) -> io::Result<File> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn lock_is_exclusive_and_reusable_without_unlinking() {
+    fn busid(text: &str) -> BusId {
+        text.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn lock_is_exclusive_and_reusable_without_unlinking() {
         let root = tempfile::tempdir().unwrap();
-        let first = open_lock(root.path(), "1-2").unwrap();
+        let first = open_lock(root.path(), busid("1-2")).unwrap();
         assert_eq!(
-            open_lock(root.path(), "1-2").unwrap_err().kind(),
+            open_lock(root.path(), busid("1-2")).unwrap_err().kind(),
             io::ErrorKind::ResourceBusy
         );
-        let independent = open_lock(root.path(), "1-3").unwrap();
+        let independent = open_lock(root.path(), busid("1-3")).unwrap();
         drop(first);
         assert!(root.path().join("device-1-2.lock").is_file());
-        let reacquired = open_lock(root.path(), "1-2").unwrap();
+        let reacquired = settle(|| open_lock(root.path(), busid("1-2")))
+            .await
+            .unwrap();
         drop((independent, reacquired));
     }
 
     #[cfg(windows)]
-    #[test]
-    fn stable_identity_lock_cannot_be_bypassed_by_moving_between_busids() {
+    #[tokio::test]
+    async fn stable_identity_lock_cannot_be_bypassed_by_moving_between_busids() {
         let root = tempfile::tempdir().unwrap();
         let identity = "USB\\VID_1234&PID_5678\\serial";
         let first_path = identity_directory(root.path(), identity).unwrap();
         let moved_path = identity_directory(root.path(), &identity.to_ascii_lowercase()).unwrap();
         assert_eq!(first_path, moved_path);
         fs::create_dir_all(&first_path).unwrap();
-        let old_busid = open_lock(root.path(), "1-2").unwrap();
-        let identity_lease = open_lock(&first_path, "lease").unwrap();
-        let new_busid = open_lock(root.path(), "1-3").unwrap();
+        let old_busid = open_lock(root.path(), busid("1-2")).unwrap();
+        let identity_lease = open_lock(&first_path, busid("lease")).unwrap();
+        let new_busid = open_lock(root.path(), busid("1-3")).unwrap();
         assert_eq!(
-            open_lock(&moved_path, "lease").unwrap_err().kind(),
+            open_lock(&moved_path, busid("lease")).unwrap_err().kind(),
             io::ErrorKind::ResourceBusy
         );
         drop(identity_lease);
-        assert!(open_lock(&moved_path, "lease").is_ok());
+        assert!(
+            settle(|| open_lock(&moved_path, busid("lease")))
+                .await
+                .is_ok()
+        );
         drop((old_busid, new_busid));
     }
 
@@ -168,14 +210,13 @@ mod tests {
     #[test]
     fn invalid_busid_cannot_escape_lock_directory() {
         let root = tempfile::tempdir().unwrap();
-        for invalid in ["../escape", ".", "", "1-2/other"] {
-            // The wire BUSID grammar permits a lone '.', but its filename is
-            // prefixed and suffixed, so it is not a path component escape.
-            if invalid == "." {
-                continue;
-            }
-            assert!(open_lock(root.path(), invalid).is_err());
+        // Lock names are BUSIDs, which reject these escapes before any lock.
+        for invalid in ["../escape", "", "1-2/other"] {
+            assert!(invalid.parse::<BusId>().is_err());
         }
-        assert!(open_lock(root.path(), ".").is_ok());
+        // The wire BUSID grammar permits a lone '.', but its filename is
+        // prefixed and suffixed, so it is not a path component escape.
+        assert!(open_lock(root.path(), busid(".")).is_ok());
+        assert!(root.path().join("device-..lock").is_file());
     }
 }

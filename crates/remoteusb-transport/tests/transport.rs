@@ -22,6 +22,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
+use remoteusb_transport::wire::{PREAMBLE as MARKER, tunnel_limits};
 use remoteusb_transport::{
     Connection, Limits, PeerConfig, run_client, run_client_with_status, run_rendezvous, run_server,
 };
@@ -36,7 +37,6 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 const WAIT: Duration = Duration::from_secs(10);
 const QUIET: Duration = Duration::from_millis(150);
-const MARKER: &[u8; 12] = b"REMOTEUSB\0\0\x01";
 const KEY: [u8; 32] = [0x42; 32];
 
 struct Identity {
@@ -145,7 +145,8 @@ impl Certificates {
                 identity.key_der.clone(),
             )?,
             [PeerIdentity::new(NodeId::new("exporter"), &pin.der)?],
-        ))
+        )
+        .with_limits(tunnel_limits(&Limits::default())))
     }
 }
 

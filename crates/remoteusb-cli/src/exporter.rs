@@ -14,8 +14,10 @@ use tokio::sync::oneshot;
 
 use crate::args::ServeArgs;
 use crate::inventory::{self, Device};
+use crate::usbip::BusId;
+use platform::DeviceHost as _;
 
-fn select_devices(text: &str, devices: &[Device]) -> io::Result<BTreeSet<String>> {
+fn select_devices(text: &str, devices: &[Device]) -> io::Result<BTreeSet<BusId>> {
     let mut selected = BTreeSet::new();
     for item in text
         .split(|character: char| character == ',' || character.is_whitespace())
@@ -32,7 +34,7 @@ fn select_devices(text: &str, devices: &[Device]) -> io::Result<BTreeSet<String>
                     "choose device numbers from the displayed list",
                 )
             })?;
-        selected.insert(devices[index].busid.clone());
+        selected.insert(devices[index].busid);
     }
     if selected.is_empty() {
         return Err(io::Error::new(
@@ -43,7 +45,7 @@ fn select_devices(text: &str, devices: &[Device]) -> io::Result<BTreeSet<String>
     Ok(selected)
 }
 
-fn pick(devices: &[Device]) -> io::Result<BTreeSet<String>> {
+fn pick(devices: &[Device]) -> io::Result<BTreeSet<BusId>> {
     if !io::stdin().is_terminal() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -81,10 +83,8 @@ pub(super) async fn run(args: ServeArgs, shutdown: impl Future<Output = ()>) -> 
             "--backend requires a nonzero port",
         ));
     }
-    for busid in &args.devices {
-        inventory::validate_busid(busid)?;
-    }
-    let devices = platform::inventory().await?;
+    let host = platform::Host::new()?;
+    let devices = host.inventory().await?;
     let allowed = if args.pick {
         Some(pick(&devices)?)
     } else if args.devices.is_empty() {
@@ -95,7 +95,7 @@ pub(super) async fn run(args: ServeArgs, shutdown: impl Future<Output = ()>) -> 
     if let Some(ids) = &allowed {
         eprintln!(
             "Available for on-demand sharing: {}",
-            ids.iter().cloned().collect::<Vec<_>>().join(", ")
+            ids.iter().map(BusId::as_str).collect::<Vec<_>>().join(", ")
         );
         eprintln!(
             "BUSID restrictions follow physical port IDs; verify the device after reconnecting hardware."
@@ -122,6 +122,7 @@ pub(super) async fn run(args: ServeArgs, shutdown: impl Future<Output = ()>) -> 
         let _ = stopped_transport.await;
     });
     let managed = backend::run(
+        host,
         listener,
         args.backend,
         allowed,
@@ -165,7 +166,7 @@ mod tests {
     #[test]
     fn selection_rejects_empty_invalid_and_out_of_range_choices() {
         let devices = vec![Device {
-            busid: "1-2".into(),
+            busid: "1-2".parse().unwrap(),
             vendor: 1,
             product: 2,
             name: "Device".into(),
@@ -177,7 +178,7 @@ mod tests {
         }
         assert_eq!(
             select_devices("1, 1", &devices).unwrap(),
-            BTreeSet::from(["1-2".into()])
+            BTreeSet::from(["1-2".parse().unwrap()])
         );
     }
 

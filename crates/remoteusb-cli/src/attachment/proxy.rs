@@ -12,6 +12,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::usbip::{self, OpHeader};
+
 #[derive(Default)]
 struct ReplyProof {
     offered: AtomicBool,
@@ -152,7 +154,7 @@ async fn forward_reply(
     observed: &ReplyProof,
 ) -> io::Result<()> {
     let mut buffer = [0; 8192];
-    let mut header = [0; 8];
+    let mut header = [0; usbip::HEADER_BYTES];
     let mut header_used = 0;
     loop {
         let read = reader.read(&mut buffer).await?;
@@ -167,21 +169,16 @@ async fn forward_reply(
             let count = read.min(header.len() - header_used);
             header[header_used..header_used + count].copy_from_slice(&buffer[..count]);
             header_used += count;
-            if header_used == header.len() && rejected_import(header) {
-                // This valid negative OP_REP_IMPORT is rejected before device
+            if header_used == header.len()
+                && OpHeader::parse(header).is_some_and(OpHeader::proves_rejected_import)
+            {
+                // A valid negative OP_REP_IMPORT proves rejection before device
                 // creation. Mark before forwarding its decisive status bytes.
                 observed.rejected.store(true, Ordering::Release);
             }
         }
         writer.write_all(&buffer[..read]).await?;
     }
-}
-
-fn rejected_import(header: [u8; 8]) -> bool {
-    let version = u16::from_be_bytes([header[0], header[1]]);
-    let code = u16::from_be_bytes([header[2], header[3]]);
-    let status = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
-    version == 0x0111 && code == 0x0003 && (1..=5).contains(&status)
 }
 
 async fn reject_until_released(listener: &TcpListener, mut released: oneshot::Receiver<()>) {
@@ -201,7 +198,8 @@ async fn reject_until_released(listener: &TcpListener, mut released: oneshot::Re
 
 #[cfg(test)]
 mod tests {
-    use super::{Proxy, rejected_import};
+    use super::Proxy;
+    use crate::usbip::{OpCode, OpHeader};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -273,31 +271,18 @@ mod tests {
         proxy.release().await.unwrap();
     }
 
-    #[test]
-    fn only_a_valid_negative_import_header_proves_rejection() {
-        assert!(rejected_import([0x01, 0x11, 0x00, 0x03, 0, 0, 0, 1]));
-        assert!(rejected_import([0x01, 0x11, 0x00, 0x03, 0, 0, 0, 5]));
-        for header in [
-            [0x01, 0x11, 0x00, 0x03, 0, 0, 0, 0],
-            [0x01, 0x11, 0x00, 0x03, 0, 0, 0, 6],
-            [0x01, 0x10, 0x00, 0x03, 0, 0, 0, 1],
-            [0x01, 0x11, 0x00, 0x05, 0, 0, 0, 1],
-        ] {
-            assert!(!rejected_import(header));
-        }
-    }
-
     #[tokio::test]
     async fn fragmented_negative_import_preserves_rejection_proof() {
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut proxy = Proxy::start(upstream.local_addr().unwrap()).await.unwrap();
         let mut driver = TcpStream::connect(proxy.address()).await.unwrap();
         let (mut receiver, _) = upstream.accept().await.unwrap();
-        receiver.write_all(&[0x01, 0x11, 0]).await.unwrap();
+        let rejection = OpHeader::new(OpCode::RepImport, 4).encode();
+        receiver.write_all(&rejection[..3]).await.unwrap();
         let mut first = [0; 3];
         driver.read_exact(&mut first).await.unwrap();
         assert!(proxy.may_have_attached());
-        receiver.write_all(&[0x03, 0, 0, 0, 4]).await.unwrap();
+        receiver.write_all(&rejection[3..]).await.unwrap();
         let mut rest = [0; 5];
         driver.read_exact(&mut rest).await.unwrap();
         assert!(!proxy.may_have_attached());

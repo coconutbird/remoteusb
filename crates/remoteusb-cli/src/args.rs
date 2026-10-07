@@ -9,6 +9,8 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 use remoteusb_transport::{Connection, Limits, PeerConfig};
 
+use crate::usbip::BusId;
+
 #[derive(Parser)]
 #[command(
     name = "remoteusb",
@@ -99,7 +101,7 @@ pub(super) struct ServeArgs {
         value_delimiter = ',',
         conflicts_with = "pick"
     )]
-    pub devices: Vec<String>,
+    pub devices: Vec<BusId>,
     /// Interactively choose which connected devices receivers may attach.
     #[arg(long)]
     pub pick: bool,
@@ -127,7 +129,7 @@ pub(super) struct ConnectArgs {
     pub listen: SocketAddr,
     /// Attach once and supervise cleanup when the receiver exits.
     #[arg(long, value_name = "BUSID")]
-    pub attach: Option<String>,
+    pub attach: Option<BusId>,
     #[arg(long, requires = "attach", value_name = "EXE")]
     pub usbip: Option<PathBuf>,
 }
@@ -136,7 +138,7 @@ pub(super) struct ConnectArgs {
 pub(super) struct AttachArgs {
     #[command(flatten)]
     pub endpoint: EndpointArgs,
-    pub busid: String,
+    pub busid: BusId,
     /// Override the installed Windows usbip-win2 executable.
     #[arg(long, value_name = "EXE")]
     pub usbip: Option<PathBuf>,

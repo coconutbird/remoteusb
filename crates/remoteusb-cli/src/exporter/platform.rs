@@ -4,16 +4,47 @@
 
 use std::io;
 
+use crate::usbip::BusId;
+
 #[cfg(any(windows, target_os = "linux"))]
 mod command;
 #[cfg(target_os = "linux")]
-#[path = "platform/linux.rs"]
-mod implementation;
-#[cfg(windows)]
-#[path = "platform/windows.rs"]
-mod implementation;
+mod linux;
 #[cfg(any(windows, target_os = "linux"))]
 mod lock;
+#[cfg(windows)]
+mod windows;
+
+/// The managed exporter's host for this OS, selected in this one place.
+#[cfg(windows)]
+pub(super) type Host = windows::WindowsHost;
+/// The managed exporter's host for this OS, selected in this one place.
+#[cfg(target_os = "linux")]
+pub(super) type Host = linux::LinuxHost;
+/// The managed exporter's host for this OS, selected in this one place.
+#[cfg(not(any(windows, target_os = "linux")))]
+pub(super) type Host = Unsupported;
+
+/// OS sharing control: device inventory and lock-guarded binding.
+pub(super) trait DeviceHost: Clone + Send + Sync + 'static {
+    /// Ownership of one bound device, released through [`Lease::restore`].
+    type Lease: Lease;
+
+    /// This OS's host; fails where managed exporting is unsupported.
+    fn new() -> io::Result<Self>;
+
+    /// Exportable devices, sorted by BUSID.
+    fn inventory(&self) -> impl Future<Output = io::Result<Vec<crate::inventory::Device>>> + Send;
+
+    /// Lock and share `busid`; the returned lease owns restoring prior state.
+    fn bind(&self, busid: BusId) -> impl Future<Output = Result<Self::Lease, BindError>> + Send;
+}
+
+/// A device bound by [`DeviceHost::bind`], holding its ownership locks.
+pub(super) trait Lease: Send + 'static {
+    /// Restore pre-bind state, then release ownership locks.
+    fn restore(self) -> impl Future<Output = io::Result<()>> + Send;
+}
 
 #[derive(Debug)]
 pub(super) struct BindError {
@@ -56,64 +87,38 @@ fn device_name(value: &str) -> String {
     }
     name
 }
-pub(super) struct Lease {
-    #[cfg(any(windows, target_os = "linux"))]
-    inner: implementation::Lease,
-    #[cfg(any(windows, target_os = "linux"))]
-    lock: std::fs::File,
-    #[cfg(windows)]
-    identity_lock: std::fs::File,
-}
 
-impl Lease {
-    pub(super) async fn restore(self) -> io::Result<()> {
-        #[cfg(any(windows, target_os = "linux"))]
-        {
-            let result = self.inner.restore().await;
-            drop(self.lock);
-            #[cfg(windows)]
-            drop(self.identity_lock);
-            result
-        }
-        #[cfg(not(any(windows, target_os = "linux")))]
-        Err(unsupported())
+/// No managed exporting host exists on this OS: [`DeviceHost::new`] always
+/// fails, so no value, inventory or lease of this type can exist.
+#[cfg(not(any(windows, target_os = "linux")))]
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Unsupported {}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+impl DeviceHost for Unsupported {
+    type Lease = Self;
+
+    fn new() -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed USB exporting requires Windows usbipd-win or Linux usbip-host",
+        ))
     }
-}
 
-pub(super) async fn inventory() -> io::Result<Vec<crate::inventory::Device>> {
-    #[cfg(any(windows, target_os = "linux"))]
-    return implementation::inventory().await;
-    #[cfg(not(any(windows, target_os = "linux")))]
-    Err(unsupported())
-}
-
-pub(super) async fn bind(busid: &str) -> Result<Lease, BindError> {
-    crate::inventory::validate_busid(busid)?;
-    #[cfg(any(windows, target_os = "linux"))]
-    {
-        let candidate = implementation::candidate(busid).await?;
-        let lock = lock::acquire(busid)?;
-        #[cfg(windows)]
-        let identity_lock = lock::acquire_identity(candidate.identity())?;
-        implementation::bind(busid, candidate)
-            .await
-            .map(|inner| Lease {
-                inner,
-                lock,
-                #[cfg(windows)]
-                identity_lock,
-            })
+    fn inventory(&self) -> impl Future<Output = io::Result<Vec<crate::inventory::Device>>> + Send {
+        async move { match *self {} }
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
-    Err(unsupported().into())
+
+    fn bind(&self, _busid: BusId) -> impl Future<Output = Result<Self, BindError>> + Send {
+        async move { match *self {} }
+    }
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn unsupported() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "managed USB exporting requires Windows usbipd-win or Linux usbip-host",
-    )
+impl Lease for Unsupported {
+    fn restore(self) -> impl Future<Output = io::Result<()>> + Send {
+        async move { match self {} }
+    }
 }
 
 #[cfg(all(test, any(windows, target_os = "linux")))]

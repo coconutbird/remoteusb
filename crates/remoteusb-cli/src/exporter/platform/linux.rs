@@ -1,92 +1,111 @@
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::inventory::Device;
+use crate::usbip::BusId;
 
-use super::{BindError, command};
+use super::{BindError, DeviceHost, Lease, command, lock};
 
-#[path = "linux/sysfs.rs"]
 mod sysfs;
 
 use sysfs::{DEVICES, DRIVERS, Snapshot};
 
-pub(super) struct Candidate {
-    identity: sysfs::Identity,
-}
+/// Linux usbip-host sharing control.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::exporter) struct LinuxHost;
 
-pub(super) async fn candidate(busid: &str) -> io::Result<Candidate> {
-    read_snapshot(busid).await.map(|snapshot| Candidate {
-        identity: snapshot.identity,
-    })
-}
+impl DeviceHost for LinuxHost {
+    type Lease = LinuxLease;
 
-pub(super) struct Lease {
-    original: Option<Snapshot>,
-}
-
-impl Lease {
-    pub(super) async fn restore(self) -> io::Result<()> {
-        let Some(original) = self.original else {
-            return Ok(());
-        };
-        restore(&original).await
+    fn new() -> io::Result<Self> {
+        Ok(Self)
     }
-}
 
-pub(super) async fn inventory() -> io::Result<Vec<Device>> {
-    let root = Path::new(DEVICES);
-    let mut devices = Vec::new();
-    let entries = fs::read_dir(root).map_err(|error| {
-        io::Error::new(error.kind(), format!(
-            "cannot enumerate {DEVICES}: {error}; Linux USB kernel support and the usbip-host module must be available before starting the exporter"
-        ))
-    })?;
-    for (count, entry) in entries.enumerate() {
-        if count >= 8192 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "USB sysfs directory exceeds 8192 entries",
-            ));
-        }
-        let entry = entry?;
-        let Some(busid) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if !sysfs::device_busid(&busid) {
-            continue;
-        }
-        match sysfs::snapshot(root, &busid).await {
-            Ok(snapshot) => devices.push(snapshot.device),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::Unsupported
-                ) =>
-            {
-                continue;
-            }
-            Err(error) => {
+    async fn inventory(&self) -> io::Result<Vec<Device>> {
+        let root = Path::new(DEVICES);
+        let mut devices = Vec::new();
+        let entries = fs::read_dir(root).map_err(|error| {
+            io::Error::new(error.kind(), format!(
+                "cannot enumerate {DEVICES}: {error}; Linux USB kernel support and the usbip-host module must be available before starting the exporter"
+            ))
+        })?;
+        for (count, entry) in entries.enumerate() {
+            if count >= 8192 {
                 return Err(io::Error::new(
-                    error.kind(),
-                    format!("cannot inspect USB {busid}: {error}"),
+                    io::ErrorKind::InvalidData,
+                    "USB sysfs directory exceeds 8192 entries",
+                ));
+            }
+            let name = entry?.file_name();
+            let Some(busid) = name
+                .to_str()
+                .and_then(|name| name.parse::<BusId>().ok())
+                .filter(|busid| sysfs::device_busid(*busid))
+            else {
+                continue;
+            };
+            match sysfs::snapshot(root, busid).await {
+                Ok(snapshot) => devices.push(snapshot.device),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::Unsupported
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("cannot inspect USB {busid}: {error}"),
+                    ));
+                }
+            }
+            if devices.len() > 1024 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "USB inventory exceeds 1024 devices",
                 ));
             }
         }
-        if devices.len() > 1024 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "USB inventory exceeds 1024 devices",
-            ));
-        }
+        devices.sort_by_key(|device| device.busid);
+        Ok(devices)
     }
-    devices.sort_by(|left, right| left.busid.cmp(&right.busid));
-    Ok(devices)
+
+    async fn bind(&self, busid: BusId) -> Result<LinuxLease, BindError> {
+        let identity = read_snapshot(busid).await?.identity;
+        let lock = lock::acquire(busid).await?;
+        // On failure `lock` drops after `share` finished any partial-bind recovery.
+        let original = share(busid, &identity).await?;
+        Ok(LinuxLease { original, lock })
+    }
 }
 
-pub(super) async fn bind(busid: &str, candidate: Candidate) -> Result<Lease, BindError> {
+/// A bound device and its ownership lock.
+pub(in crate::exporter) struct LinuxLease {
+    // None means the sharing existed before this session. Never unbind it.
+    original: Option<Snapshot>,
+    lock: File,
+}
+
+impl Lease for LinuxLease {
+    async fn restore(self) -> io::Result<()> {
+        let result = match &self.original {
+            Some(original) => restore(original).await,
+            None => Ok(()),
+        };
+        // Ownership ends only after cleanup.
+        drop(self.lock);
+        result
+    }
+}
+
+/// Share `busid` if `identity` still occupies it; the caller holds its lock.
+/// Returns the pre-bind snapshot when this call created the sharing.
+async fn share(busid: BusId, identity: &sysfs::Identity) -> Result<Option<Snapshot>, BindError> {
     let original = read_snapshot(busid).await?;
-    if original.identity != candidate.identity {
+    if original.identity != *identity {
         return Err(io::Error::other(format!(
             "USB {busid} identity changed while acquiring its ownership lock"
         ))
@@ -100,7 +119,7 @@ pub(super) async fn bind(busid: &str, candidate: Candidate) -> Result<Lease, Bin
         .into());
     }
     if original.device.shared {
-        return Ok(Lease { original: None });
+        return Ok(None);
     }
     // Never load modules or alter preexisting match-table policy. The stock
     // usbip tool cannot distinguish ownership of an existing match entry.
@@ -111,7 +130,7 @@ pub(super) async fn bind(busid: &str, candidate: Candidate) -> Result<Lease, Bin
     // Upstream usbip bind first unbinds the device's driver, then creates a
     // match entry and binds usbip-host. Any of these stages can fail.
     // https://github.com/torvalds/linux/blob/master/tools/usb/usbip/src/usbip_bind.c
-    let result = command::run("usbip", &["bind", "--busid", busid], &[]).await;
+    let result = command::run("usbip", &["bind", "--busid", busid.as_str()], &[]).await;
     if result
         .as_ref()
         .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
@@ -135,9 +154,7 @@ pub(super) async fn bind(busid: &str, candidate: Candidate) -> Result<Lease, Bin
         current.identity == original.identity && current.device.shared && !current.device.busy
     });
     if result.is_ok() && valid {
-        return Ok(Lease {
-            original: Some(original),
-        });
+        return Ok(Some(original));
     }
     let error = result.err().unwrap_or_else(|| {
         io::Error::other(format!(
@@ -154,14 +171,14 @@ pub(super) async fn bind(busid: &str, candidate: Candidate) -> Result<Lease, Bin
 
 async fn restore(original: &Snapshot) -> io::Result<()> {
     check(original).await?;
-    let busid = &original.device.busid;
+    let busid = original.device.busid;
     let mut current = read_snapshot(busid).await?;
     if current.driver.as_deref() == Some("usbip-host") {
         // Upstream unbind also deletes match_busid and triggers device_attach
         // through usbip-host/rebind. This reprobes the default driver, not
         // necessarily the drivers that were bound before our session.
         // https://github.com/torvalds/linux/blob/master/tools/usb/usbip/src/usbip_unbind.c
-        let result = command::run("usbip", &["unbind", "--busid", busid], &[]).await;
+        let result = command::run("usbip", &["unbind", "--busid", busid.as_str()], &[]).await;
         if result
             .as_ref()
             .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
@@ -221,7 +238,7 @@ async fn restore(original: &Snapshot) -> io::Result<()> {
 }
 
 async fn restore_configuration(original: &Snapshot) -> io::Result<()> {
-    let current = read_snapshot(&original.device.busid).await?;
+    let current = read_snapshot(original.device.busid).await?;
     if current.configuration == original.configuration {
         return Ok(());
     }
@@ -236,12 +253,12 @@ async fn restore_configuration(original: &Snapshot) -> io::Result<()> {
     write_attribute(
         original,
         Path::new(DEVICES)
-            .join(&original.device.busid)
+            .join(original.device.busid.as_str())
             .join("bConfigurationValue"),
         &value,
     )
     .await?;
-    let restored = read_snapshot(&original.device.busid).await?;
+    let restored = read_snapshot(original.device.busid).await?;
     if restored.configuration != original.configuration {
         return Err(io::Error::other(format!(
             "USB {} did not return to its original configuration",
@@ -264,10 +281,10 @@ async fn restore_device_driver(original: &Snapshot, current: &Snapshot) -> io::R
                 original.device.busid
             )));
         }
-        driver_write(original, driver, "unbind", &original.device.busid).await?;
+        driver_write(original, driver, "unbind", original.device.busid.as_str()).await?;
     }
     if let Some(driver) = &original.driver {
-        driver_write(original, driver, "bind", &original.device.busid).await?;
+        driver_write(original, driver, "bind", original.device.busid.as_str()).await?;
     }
     Ok(())
 }
@@ -324,7 +341,7 @@ async fn write_attribute(original: &Snapshot, path: PathBuf, value: &str) -> io:
         .map_err(|error| io::Error::new(error.kind(), format!("cannot restore USB {} via {path}: {error}; root/sysfs write permission is required", original.device.busid)))
 }
 
-async fn read_snapshot(busid: &str) -> io::Result<Snapshot> {
+async fn read_snapshot(busid: BusId) -> io::Result<Snapshot> {
     sysfs::snapshot(Path::new(DEVICES), busid).await
 }
 
@@ -332,8 +349,10 @@ async fn check(snapshot: &Snapshot) -> io::Result<()> {
     snapshot.check(Path::new(DEVICES)).await
 }
 
-async fn matching(busid: &str) -> io::Result<bool> {
+async fn matching(busid: BusId) -> io::Result<bool> {
     let value = sysfs::attribute(&Path::new(DRIVERS).join("usbip-host"), "match_busid").await
         .map_err(|error| io::Error::new(error.kind(), format!("cannot inspect usbip-host match table: {error}; load the installed usbip-host module before exporting")))?;
-    Ok(value.split_ascii_whitespace().any(|entry| entry == busid))
+    Ok(value
+        .split_ascii_whitespace()
+        .any(|entry| entry == busid.as_str()))
 }

@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::io;
 use std::net::SocketAddr;
 
-use super::{port, validate_busid};
+use super::{client_busid, port};
+use crate::invalid_data;
+use crate::usbip::BusId;
 
 /// Parse the released usbip-win2 `port` producer, not Linux output or substrings.
 /// Empty successful output is the producer's zero-device case. Unknown or
@@ -10,19 +12,20 @@ use super::{port, validate_busid};
 pub(super) fn endpoint_present(
     output: &[u8],
     address: SocketAddr,
-    busid: &str,
+    busid: BusId,
 ) -> io::Result<bool> {
-    let text = std::str::from_utf8(output).map_err(|_| invalid("non-UTF8 USB/IP port status"))?;
+    let text =
+        std::str::from_utf8(output).map_err(|_| invalid_data("non-UTF8 USB/IP port status"))?;
     if text.is_empty() {
         return Ok(false);
     }
     if !text.ends_with('\n') {
-        return Err(invalid("truncated USB/IP port status"));
+        return Err(invalid_data("truncated USB/IP port status"));
     }
     let mut lines = text.lines();
     if lines.next() != Some("Imported USB devices") || lines.next() != Some("====================")
     {
-        return Err(invalid("unknown USB/IP port status header"));
+        return Err(invalid_data("unknown USB/IP port status header"));
     }
     let expected = format!("usbip://{}:{}/{}", address.ip(), address.port(), busid);
     let mut found = false;
@@ -30,56 +33,56 @@ pub(super) fn endpoint_present(
     while let Some(line) = lines.next() {
         let entry = line
             .strip_prefix("Port ")
-            .ok_or_else(|| invalid("unknown USB/IP port record"))?;
+            .ok_or_else(|| invalid_data("unknown USB/IP port record"))?;
         let (number, speed) = entry
             .split_once(": device in use at ")
-            .ok_or_else(|| invalid("invalid USB/IP port record"))?;
+            .ok_or_else(|| invalid_data("invalid USB/IP port record"))?;
         if !decimal(number) {
-            return Err(invalid("invalid USB/IP port number"));
+            return Err(invalid_data("invalid USB/IP port number"));
         }
         let number = port(number.as_bytes())?;
         if speed.is_empty() || !ports.insert(number) {
-            return Err(invalid("ambiguous USB/IP port record"));
+            return Err(invalid_data("ambiguous USB/IP port record"));
         }
         let product = lines
             .next()
-            .ok_or_else(|| invalid("missing USB/IP product record"))?;
+            .ok_or_else(|| invalid_data("missing USB/IP product record"))?;
         if !product.starts_with("         ") {
-            return Err(invalid("invalid USB/IP product record"));
+            return Err(invalid_data("invalid USB/IP product record"));
         }
         let location = lines
             .next()
             .and_then(|line| line.strip_prefix("           -> "))
-            .ok_or_else(|| invalid("missing USB/IP endpoint record"))?;
+            .ok_or_else(|| invalid_data("missing USB/IP endpoint record"))?;
         validate_location(location)?;
         found |= location == expected;
         let remote = lines
             .next()
             .and_then(|line| line.strip_prefix("           -> remote bus/dev: "))
-            .ok_or_else(|| invalid("missing USB/IP bus/device record"))?;
+            .ok_or_else(|| invalid_data("missing USB/IP bus/device record"))?;
         let (bus, device) = remote
             .split_once('/')
-            .ok_or_else(|| invalid("invalid USB/IP bus/device record"))?;
+            .ok_or_else(|| invalid_data("invalid USB/IP bus/device record"))?;
         if !decimal(bus) || !decimal(device) {
-            return Err(invalid("invalid USB/IP bus/device number"));
+            return Err(invalid_data("invalid USB/IP bus/device number"));
         }
         if lines
             .next()
             .and_then(|line| line.strip_prefix("           -> serial: "))
             .is_none()
         {
-            return Err(invalid("missing USB/IP serial record"));
+            return Err(invalid_data("missing USB/IP serial record"));
         }
         if lines
             .next()
             .and_then(|line| line.strip_prefix("           -> mode: "))
             .is_none_or(str::is_empty)
         {
-            return Err(invalid("missing USB/IP receive-mode record"));
+            return Err(invalid_data("missing USB/IP receive-mode record"));
         }
     }
     if ports.is_empty() {
-        return Err(invalid("USB/IP port header without complete records"));
+        return Err(invalid_data("USB/IP port header without complete records"));
     }
     Ok(found)
 }
@@ -87,14 +90,14 @@ pub(super) fn endpoint_present(
 fn validate_location(location: &str) -> io::Result<()> {
     let endpoint = location
         .strip_prefix("usbip://")
-        .ok_or_else(|| invalid("unknown USB/IP endpoint URI"))?;
+        .ok_or_else(|| invalid_data("unknown USB/IP endpoint URI"))?;
     let (authority, busid) = endpoint
         .rsplit_once('/')
-        .ok_or_else(|| invalid("invalid USB/IP endpoint URI"))?;
-    validate_busid(busid)?;
+        .ok_or_else(|| invalid_data("invalid USB/IP endpoint URI"))?;
+    client_busid(busid)?;
     let (host, service) = authority
         .rsplit_once(':')
-        .ok_or_else(|| invalid("invalid USB/IP endpoint service"))?;
+        .ok_or_else(|| invalid_data("invalid USB/IP endpoint service"))?;
     if host.is_empty()
         || !decimal(service)
         || service
@@ -102,7 +105,7 @@ fn validate_location(location: &str) -> io::Result<()> {
             .ok()
             .is_none_or(|service| service == 0)
     {
-        return Err(invalid("invalid USB/IP endpoint host/service"));
+        return Err(invalid_data("invalid USB/IP endpoint host/service"));
     }
     Ok(())
 }
@@ -115,9 +118,9 @@ fn decimal(text: &str) -> bool {
 /// successful command with zero requests does not fence a later retry insertion.
 pub(super) fn stopped_count(stderr: &[u8]) -> io::Result<u32> {
     let text = std::str::from_utf8(stderr)
-        .map_err(|_| invalid("non-UTF8 USB/IP retry cancellation response"))?;
+        .map_err(|_| invalid_data("non-UTF8 USB/IP retry cancellation response"))?;
     if !text.ends_with('\n') {
-        return Err(invalid("truncated USB/IP retry cancellation response"));
+        return Err(invalid_data("truncated USB/IP retry cancellation response"));
     }
     let mut count = None;
     for line in text.lines() {
@@ -126,25 +129,22 @@ pub(super) fn stopped_count(stderr: &[u8]) -> io::Result<u32> {
             .and_then(|line| line.strip_suffix(" request(s) stopped"))
         {
             if count.is_some() || !decimal(value) {
-                return Err(invalid("ambiguous USB/IP retry cancellation count"));
+                return Err(invalid_data("ambiguous USB/IP retry cancellation count"));
             }
             count = Some(
                 value
                     .parse::<u32>()
-                    .map_err(|_| invalid("invalid USB/IP retry cancellation count"))?,
+                    .map_err(|_| invalid_data("invalid USB/IP retry cancellation count"))?,
             );
         }
     }
-    count.ok_or_else(|| invalid("USB/IP client did not acknowledge retry cancellation count"))
-}
-
-fn invalid(detail: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, detail)
+    count.ok_or_else(|| invalid_data("USB/IP client did not acknowledge retry cancellation count"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{endpoint_present, stopped_count};
+    use crate::usbip::BusId;
 
     fn record(host: &str, service: u16, busid: &str) -> String {
         format!(
@@ -154,21 +154,24 @@ mod tests {
 
     #[test]
     fn released_port_output_selects_exact_private_endpoint_and_busid() {
+        let busid: BusId = "1-2".parse().unwrap();
+        let other: BusId = "1-20".parse().unwrap();
         let address = "127.0.0.1:1234".parse().unwrap();
         let output = record("127.0.0.1", 1234, "1-2");
-        assert!(endpoint_present(output.as_bytes(), address, "1-2").unwrap());
-        assert!(!endpoint_present(output.as_bytes(), address, "1-20").unwrap());
+        assert!(endpoint_present(output.as_bytes(), address, busid).unwrap());
+        assert!(!endpoint_present(output.as_bytes(), address, other).unwrap());
         assert!(
-            !endpoint_present(output.as_bytes(), "127.0.0.1:123".parse().unwrap(), "1-2").unwrap()
+            !endpoint_present(output.as_bytes(), "127.0.0.1:123".parse().unwrap(), busid).unwrap()
         );
-        assert!(endpoint_present(output.replace('\n', "\r\n").as_bytes(), address, "1-2").unwrap());
+        assert!(endpoint_present(output.replace('\n', "\r\n").as_bytes(), address, busid).unwrap());
         let output = record("::1", 1234, "1-2");
-        assert!(endpoint_present(output.as_bytes(), "[::1]:1234".parse().unwrap(), "1-2").unwrap());
-        assert!(!endpoint_present(b"", address, "1-2").unwrap());
+        assert!(endpoint_present(output.as_bytes(), "[::1]:1234".parse().unwrap(), busid).unwrap());
+        assert!(!endpoint_present(b"", address, busid).unwrap());
     }
 
     #[test]
     fn incomplete_or_unknown_status_cannot_prove_absence() {
+        let busid: BusId = "1-2".parse().unwrap();
         let address = "127.0.0.1:1234".parse().unwrap();
         let valid = record("127.0.0.1", 1234, "1-2");
         for invalid in [
@@ -176,13 +179,13 @@ mod tests {
             "Imported USB devices\n====================\n",
             valid.trim_end(),
         ] {
-            assert!(endpoint_present(invalid.as_bytes(), address, "1-2").is_err());
+            assert!(endpoint_present(invalid.as_bytes(), address, busid).is_err());
         }
         assert!(
             endpoint_present(
                 valid.replace("-> usbip://", "-> unknown://").as_bytes(),
                 address,
-                "1-2"
+                busid
             )
             .is_err()
         );

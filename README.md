@@ -94,6 +94,16 @@ half-closes. Setup deadlines do not become device idle timeouts. No broken USB
 stream is silently reconnected. An attached receiver exits and requests cleanup
 when its device stream ends; a plain `connect` listener can serve multiple streams.
 
+Every Groupnet link remoteusb uses is reliable TCP (direct, punched or relayed),
+so TCP owns congestion control. Each stream gets a fixed bounded window of 2 MiB
+per direction in 32 KiB segments, and every queue on the path holds a full window
+without dropping. Earlier releases used Groupnet's control-plane defaults (16 KiB
+in flight, growing from 2 KiB) and dropped segments locally under USB bursts; the
+resulting retransmission backoff made Internet-latency storage practically
+unusable. Wire protocol version 2 marks this change: **update both endpoints**.
+A version 1 peer cannot complete the TLS handshake with a version 2 peer and
+fails after the setup deadline.
+
 The workspace uses Rust 2024 and resolver 3. Dependency direction is
 `remoteusb-cli -> remoteusb-transport -> Groupnet`; existing USB/IP driver policy
 remains outside the transport. Logs contain connection metadata and successful
@@ -335,8 +345,8 @@ with the real exporter IP (the example address is documentation-only):
 ```
 
 `list` reads the exporter's connected-device inventory over an authenticated
-tunnel and exits; it needs no receiving USB/IP driver. Both endpoints must use
-the managed-inventory version of remoteusb. `attach` uses installed **usbip-win2**, chooses its loopback port
+tunnel and exits; it needs no receiving USB/IP driver. Both endpoints must run
+the same remoteusb protocol version. `attach` uses installed **usbip-win2**, chooses its loopback port
 internally, and stays in the foreground. Run attachment in an administrator
 terminal when required by the installed driver. There is no public `detach`
 command: stop device activity and press Ctrl-C in the receiver to detach.
@@ -583,6 +593,49 @@ This Rust hardware case passed on Windows against the approved spare USB drive
 mounted through a local direct remoteusb tunnel. Its test file was removed and
 the operator restored the original mount/sharing state after the run. The same
 test has not yet qualified a physical drive over relay or an Internet path.
+
+## Opt-in real-device WAN test
+
+[`crates/remoteusb-cli/tests/wan.rs`](crates/remoteusb-cli/tests/wan.rs) always
+uses real hardware: there is no synthetic device mode. Pass the exporter BUSID
+manually. On a Windows machine with usbipd-win and usbip-win2, it runs this
+build's actual `serve --device BUSID` and `attach` through a loopback WAN link
+with one-way delay and bandwidth pacing, using freshly generated credentials.
+
+```powershell
+$env:REMOTEUSB_WAN_DEVICE = '6-8'          # required: exporter BUSID
+$env:REMOTEUSB_TEST_DRIVE = 'D:'           # optional: volume it appears as, for file I/O
+cargo +1.99.0 test --locked -p remoteusb-cli --test wan -- --ignored --nocapture
+Remove-Item Env:REMOTEUSB_WAN_DEVICE, Env:REMOTEUSB_TEST_DRIVE
+```
+
+Defaults are 80 ms round-trip time and 50 Mbit/s per direction; override them
+with `REMOTEUSB_WAN_RTT_MS` (1–1000) and `REMOTEUSB_WAN_MBIT` (1–1000).
+`REMOTEUSB_USBIP` overrides the receiving `usbip.exe`. The test prints
+`WAN RESULT key=value` lines for discovery, attachment and, with a drive, the
+same 16 MiB write/flush/reopen/verify cycle as the real-drive test. It asserts
+completion, data integrity and deadlines, not hardware-specific speeds.
+
+The selected device is shared, attached and then released through the exporter's
+own on-demand lifecycle: the device is taken from the exporter host during the
+run, and the test waits until the exporter reports it restored before stopping.
+The test never binds, unbinds or detaches devices itself. It is ignored by
+default and fails without a device; non-Windows receivers fail explicitly
+because automatic attachment requires usbip-win2.
+
+Measured on Windows with a spare USB 3.2 drive (BUSID `6-8`) through this test:
+
+| Emulated link | Volume appears | Verified file I/O |
+| --- | --- | --- |
+| 1 ms RTT, 1000 Mbit/s | 7.3 s | 3.35 MB/s |
+| 80 ms RTT, 50 Mbit/s | 63 s | 0.34 MB/s |
+
+Before the flow-control fix, a single 64 KiB request/response through the same
+transport took 3.4 s at 80 ms RTT; it now takes 93 ms, within about 3 ms of the
+physical round trip. The remaining WAN cost is USB/IP itself: storage commands
+travel as sequential URB round trips, so mounting and file I/O scale with RTT.
+Expect interactive devices such as security keys to be responsive and bulk
+storage to be usable but latency-bound over the Internet.
 
 ## Security, shutdown, and troubleshooting
 

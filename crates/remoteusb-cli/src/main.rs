@@ -6,6 +6,7 @@ mod credentials;
 mod discovery;
 mod exporter;
 mod inventory;
+mod usbip;
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -16,6 +17,11 @@ use remoteusb_transport::{run_client, run_rendezvous};
 use tokio::net::TcpListener;
 
 use args::{Cli, Command};
+
+/// Malformed peer, tool or wire data.
+fn invalid_data(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
 
 async fn bind(address: SocketAddr) -> io::Result<TcpListener> {
     require_loopback(address, "--listen")?;

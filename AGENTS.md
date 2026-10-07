@@ -29,6 +29,13 @@ The toolchain is pinned to the version used to verify this project.
 - Keep each function below 200 lines. Use rustfmt defaults.
 - No avoidable allocation or copying in the transfer path. Keep memory bounded,
   use backpressure, and never buffer an entire peer-controlled transfer.
+- Size every queue on a stream's path from the one flow policy in
+  `remoteusb-transport/src/flow.rs`. Links are reliable TCP: a local drop is seen
+  as loss and triggers retransmission backoff, so no queue may drop a full window.
+  Changing segment size or the preamble is a wire-protocol change for both peers.
+- Validate at the boundary into types (e.g. `BusId`, typed USB/IP headers) and
+  keep one owner per wire format or policy. Use traits for genuine alternative
+  implementations (endpoint roles, OS device hosts), not single-use indirection.
 - Share dependency versions at the workspace root; inherit them in every crate.
   Do not add dependencies for functionality already served clearly by std.
 - Errors carry operational context but never USB payloads or key material.
@@ -85,3 +92,5 @@ Run the actual CLI for meaningful behavior changes; tests alone do not prove
 that deployed endpoints work. Distinguish loopback transport evidence from real
 hardware/driver qualification. Keep README usage and security claims aligned
 with implementation. Never commit certificates, private keys, or device data.
+The WAN test in `remoteusb-cli/tests/wan.rs` is always real hardware: the operator
+passes the device; never add a synthetic mode to it.

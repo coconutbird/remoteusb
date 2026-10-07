@@ -6,33 +6,30 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use super::platform;
-use crate::inventory;
+use super::platform::{DeviceHost, Lease as _};
+use crate::usbip::{self, BusId, DeviceRecord, OpCode, OpHeader};
+use crate::{invalid_data, inventory};
 
-const IMPORT: [u8; 8] = [1, 0x11, 0x80, 3, 0, 0, 0, 0];
-const DEVLIST: [u8; 8] = [1, 0x11, 0x80, 5, 0, 0, 0, 0];
-const IMPORT_REJECTED: [u8; 8] = [1, 0x11, 0, 3, 0, 0, 0, 1];
 const MAX_DEVICES: u32 = 1024;
-const DEVICE_BYTES: usize = 312;
 
 #[derive(Clone)]
 struct Policy {
-    allowed: Option<Arc<BTreeSet<String>>>,
-    reserved: Arc<Mutex<BTreeSet<String>>>,
+    allowed: Option<Arc<BTreeSet<BusId>>>,
+    reserved: Arc<Mutex<BTreeSet<BusId>>>,
 }
 
 impl Policy {
-    fn permits(&self, busid: &str) -> bool {
-        self.allowed.as_ref().is_none_or(|ids| ids.contains(busid))
+    fn permits(&self, busid: BusId) -> bool {
+        self.allowed.as_ref().is_none_or(|ids| ids.contains(&busid))
     }
 
-    fn reserve(&self, busid: &str) -> io::Result<Reservation> {
+    fn reserve(&self, busid: BusId) -> io::Result<Reservation> {
         if !self.permits(busid) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -43,7 +40,7 @@ impl Policy {
             .reserved
             .lock()
             .map_err(|_| io::Error::other("device reservation lock poisoned"))?
-            .insert(busid.to_owned())
+            .insert(busid)
         {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -51,7 +48,7 @@ impl Policy {
             ));
         }
         Ok(Reservation {
-            busid: busid.to_owned(),
+            busid,
             reserved: Arc::clone(&self.reserved),
             release: true,
         })
@@ -64,15 +61,15 @@ impl Policy {
             .map_err(|_| io::Error::other("device reservation lock poisoned"))?;
         devices.retain_mut(|device| {
             device.busy |= reserved.contains(&device.busid);
-            self.permits(&device.busid)
+            self.permits(device.busid)
         });
         Ok(())
     }
 }
 
 struct Reservation {
-    busid: String,
-    reserved: Arc<Mutex<BTreeSet<String>>>,
+    busid: BusId,
+    reserved: Arc<Mutex<BTreeSet<BusId>>>,
     release: bool,
 }
 
@@ -92,23 +89,6 @@ impl Drop for Reservation {
             reserved.remove(&self.busid);
         }
     }
-}
-
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-fn busid(bytes: &[u8; 32]) -> io::Result<&str> {
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .ok_or_else(|| invalid("unterminated USB/IP BUSID"))?;
-    if bytes[end..].iter().any(|byte| *byte != 0) {
-        return Err(invalid("nonzero USB/IP BUSID padding"));
-    }
-    let id = std::str::from_utf8(&bytes[..end]).map_err(|_| invalid("invalid USB/IP BUSID"))?;
-    inventory::validate_busid(id)?;
-    Ok(id)
 }
 
 async fn stopped(receiver: &mut watch::Receiver<bool>) {
@@ -184,10 +164,11 @@ async fn finish_mutation<T>(
     }
 }
 
-pub(super) async fn run(
+pub(super) async fn run<H: DeviceHost>(
+    host: H,
     listener: TcpListener,
     backend: SocketAddr,
-    allowed: Option<BTreeSet<String>>,
+    allowed: Option<BTreeSet<BusId>>,
     shutdown: impl Future<Output = ()>,
     max_connections: usize,
     setup_timeout: Duration,
@@ -206,11 +187,6 @@ pub(super) async fn run(
             io::ErrorKind::InvalidInput,
             "managed backend endpoints must be loopback with a nonzero backend port",
         ));
-    }
-    if let Some(ids) = &allowed {
-        for id in ids {
-            inventory::validate_busid(id)?;
-        }
     }
     let policy = Policy {
         allowed: allowed.map(Arc::new),
@@ -233,9 +209,10 @@ pub(super) async fn run(
             connection = listener.accept(), if sessions.len() < max_connections => {
                 match connection {
                     Ok((socket, _)) => {
+                        let host = host.clone();
                         let policy = policy.clone();
                         let stop = stopped.clone();
-                        sessions.spawn(handle(socket, backend, policy, stop, setup_timeout));
+                        sessions.spawn(handle(host, socket, backend, policy, stop, setup_timeout));
                     },
                     Err(error) => { failure = Some(error); break; },
                 }
@@ -270,13 +247,14 @@ fn session_failure(
     }
 }
 
-async fn reject(socket: &mut TcpStream, deadline: Instant) {
-    // A separate bounded write still permits negative proof after setup expired.
+/// A separate bounded write still permits negative proof after setup expired.
+async fn reject(socket: &mut TcpStream, header: OpHeader, deadline: Instant) {
     let deadline = deadline.max(Instant::now() + Duration::from_secs(1));
-    let _ = tokio::time::timeout_at(deadline, socket.write_all(&IMPORT_REJECTED)).await;
+    let _ = tokio::time::timeout_at(deadline, socket.write_all(&header.encode())).await;
 }
 
-async fn handle(
+async fn handle<H: DeviceHost>(
+    host: H,
     mut socket: TcpStream,
     backend: SocketAddr,
     policy: Policy,
@@ -284,21 +262,22 @@ async fn handle(
     setup_timeout: Duration,
 ) -> io::Result<()> {
     let deadline = Instant::now() + setup_timeout;
-    let mut header = [0; 8];
+    let mut header = [0; usbip::HEADER_BYTES];
     if setup(socket.read_exact(&mut header), deadline, &mut stop)
         .await
         .is_err()
     {
         return Ok(());
     }
-    if header == IMPORT {
+    let request = OpHeader::parse(header);
+    if request == Some(OpHeader::IMPORT_REQUEST) {
         // Import owns its cleanup result separately from session/network errors.
-        return import(socket, backend, policy, stop, deadline).await;
+        return import(&host, socket, backend, policy, stop, deadline).await;
     }
     let result = if header == inventory::REQUEST {
         setup(
             async {
-                let mut devices = platform::inventory().await?;
+                let mut devices = host.inventory().await?;
                 policy.filter(&mut devices)?;
                 inventory::send(&mut socket, &devices).await
             },
@@ -306,7 +285,7 @@ async fn handle(
             &mut stop,
         )
         .await
-    } else if header == DEVLIST {
+    } else if request == Some(OpHeader::DEVLIST_REQUEST) {
         setup(
             async {
                 let reply = device_list(backend, &policy).await?;
@@ -317,10 +296,10 @@ async fn handle(
         )
         .await
     } else {
-        if header[..4] == IMPORT[..4] {
-            reject(&mut socket, deadline).await;
+        if request.is_some_and(|request| request.code == OpCode::ReqImport) {
+            reject(&mut socket, OpHeader::IMPORT_REJECTED, deadline).await;
         }
-        Err(invalid("unsupported managed USB/IP request"))
+        Err(invalid_data("unsupported managed USB/IP request"))
     };
     if let Err(error) = result {
         let _ = writeln!(io::stderr(), "managed USB/IP request failed: {error}");
@@ -328,18 +307,19 @@ async fn handle(
     Ok(())
 }
 
-async fn import(
+async fn import<H: DeviceHost>(
+    host: &H,
     mut socket: TcpStream,
     backend: SocketAddr,
     policy: Policy,
     mut stop: watch::Receiver<bool>,
     deadline: Instant,
 ) -> io::Result<()> {
-    let mut id = [0; 32];
+    let mut field = [0; usbip::BUSID_BYTES];
     let reserved = setup(
         async {
-            socket.read_exact(&mut id).await?;
-            policy.reserve(busid(&id)?)
+            socket.read_exact(&mut field).await?;
+            policy.reserve(BusId::decode(&field)?)
         },
         deadline,
         &mut stop,
@@ -349,7 +329,7 @@ async fn import(
         Ok(reservation) => reservation,
         Err(error) => {
             if !*stop.borrow() {
-                reject(&mut socket, deadline).await;
+                reject(&mut socket, OpHeader::IMPORT_REJECTED, deadline).await;
             }
             let _ = writeln!(io::stderr(), "managed USB/IP import rejected: {error}");
             return Ok(());
@@ -361,24 +341,20 @@ async fn import(
         return Ok(());
     }
     if Instant::now() >= deadline {
-        reject(&mut socket, deadline).await;
+        reject(&mut socket, OpHeader::IMPORT_REJECTED, deadline).await;
         return Ok(());
     }
+    let busid = reservation.busid;
     let mut socket = Some(socket);
-    let (bound, cancelled) = settle_mutation(
-        platform::bind(&reservation.busid),
-        &mut socket,
-        deadline,
-        &mut stop,
-    )
-    .await;
+    let (bound, cancelled) =
+        settle_mutation(host.bind(busid), &mut socket, deadline, &mut stop).await;
     let lease = match bound {
         Ok(lease) => lease,
         Err(error) => {
             if !*stop.borrow()
                 && let Some(socket) = &mut socket
             {
-                reject(socket, deadline).await;
+                reject(socket, OpHeader::IMPORT_REJECTED, deadline).await;
             }
             if error.cleanup_failed {
                 reservation.preserve();
@@ -396,9 +372,9 @@ async fn import(
         }
     };
     let outcome = if cancelled {
-        Attachment::Reject(IMPORT_REJECTED, None)
+        Attachment::Reject(OpHeader::IMPORT_REJECTED, None)
     } else if let Some(socket) = &mut socket {
-        attach(socket, backend, &id, deadline, &mut stop).await
+        attach(socket, backend, busid, deadline, &mut stop).await
     } else {
         Attachment::Ended(Err(io::Error::other(
             "managed import lost its owned socket",
@@ -415,8 +391,7 @@ async fn import(
         if let Some(socket) = &mut socket
             && !*stop.borrow()
         {
-            let deadline = deadline.max(Instant::now() + Duration::from_secs(1));
-            let _ = tokio::time::timeout_at(deadline, socket.write_all(&header)).await;
+            reject(socket, header, deadline).await;
         }
         if let Some(error) = error {
             let _ = writeln!(io::stderr(), "managed USB/IP import rejected: {error}");
@@ -434,76 +409,75 @@ async fn import(
         .map_err(|error| io::Error::other(format!("device sharing restoration failed: {error}")))
 }
 
-struct ImportReply {
-    upstream: TcpStream,
-    bytes: [u8; 8 + DEVICE_BYTES],
-    length: usize,
-}
+/// A native `OP_REP_IMPORT`: the success header and device record to forward
+/// verbatim, or the backend's own rejection header.
+type ImportReply = Result<[u8; usbip::IMPORT_REPLY_BYTES], OpHeader>;
 
-async fn native_import(backend: SocketAddr, id: &[u8; 32]) -> io::Result<ImportReply> {
+async fn native_import(backend: SocketAddr, busid: BusId) -> io::Result<(TcpStream, ImportReply)> {
     let mut upstream = TcpStream::connect(backend).await?;
-    upstream.write_all(&IMPORT).await?;
-    upstream.write_all(id).await?;
-    let (bytes, length) = decode_import(&mut upstream, id).await?;
-    Ok(ImportReply {
-        upstream,
-        bytes,
-        length,
-    })
+    upstream
+        .write_all(&OpHeader::IMPORT_REQUEST.encode())
+        .await?;
+    upstream.write_all(busid.field()).await?;
+    let reply = decode_import(&mut upstream, busid).await?;
+    Ok((upstream, reply))
 }
 
 async fn decode_import(
     reader: &mut (impl AsyncRead + Unpin),
-    id: &[u8; 32],
-) -> io::Result<([u8; 8 + DEVICE_BYTES], usize)> {
-    let mut bytes = [0; 8 + DEVICE_BYTES];
-    reader.read_exact(&mut bytes[..8]).await?;
-    if bytes[..4] != [1, 0x11, 0, 3] {
-        return Err(invalid("invalid native USB/IP import reply"));
-    }
-    let length = if bytes[4..8] == [0; 4] {
-        reader.read_exact(&mut bytes[8..]).await?;
-        let returned: &[u8; 32] = bytes[264..296].try_into().expect("32-byte native BUSID");
-        if busid(returned)? != busid(id)? {
-            return Err(invalid("native USB/IP imported a different BUSID"));
-        }
-        bytes.len()
-    } else {
+    busid: BusId,
+) -> io::Result<ImportReply> {
+    let mut header = [0; usbip::HEADER_BYTES];
+    reader.read_exact(&mut header).await?;
+    let reply = OpHeader::parse(header)
+        .filter(|reply| reply.code == OpCode::RepImport)
+        .ok_or_else(|| invalid_data("invalid native USB/IP import reply"))?;
+    if reply.status != usbip::ST_OK {
         // Forward the real backend's rejection without inventing descriptors.
-        8
-    };
-    Ok((bytes, length))
+        return Ok(Err(reply));
+    }
+    let mut bytes = [0; usbip::IMPORT_REPLY_BYTES];
+    let (prefix, record) = bytes
+        .split_last_chunk_mut::<{ usbip::DEVICE_BYTES }>()
+        .expect("an import reply is one header and one device record");
+    prefix.copy_from_slice(&header);
+    reader.read_exact(record).await?;
+    if DeviceRecord::new(record).busid()? != busid {
+        return Err(invalid_data("native USB/IP imported a different BUSID"));
+    }
+    Ok(Ok(bytes))
 }
 
 enum Attachment {
-    Reject([u8; 8], Option<io::Error>),
+    Reject(OpHeader, Option<io::Error>),
     Ended(io::Result<()>),
 }
 
 async fn attach(
     socket: &mut TcpStream,
     backend: SocketAddr,
-    id: &[u8; 32],
+    busid: BusId,
     deadline: Instant,
     stop: &mut watch::Receiver<bool>,
 ) -> Attachment {
     let native = tokio::select! {
         biased;
         () = disconnected(socket) => return Attachment::Ended(Ok(())),
-        result = setup(native_import(backend, id), deadline, stop) => result,
+        result = setup(native_import(backend, busid), deadline, stop) => result,
     };
-    let mut reply = match native {
+    let (mut upstream, reply) = match native {
+        Ok(native) => native,
+        Err(error) => return Attachment::Reject(OpHeader::IMPORT_REJECTED, Some(error)),
+    };
+    let reply = match reply {
         Ok(reply) => reply,
-        Err(error) => return Attachment::Reject(IMPORT_REJECTED, Some(error)),
+        Err(rejection) => return Attachment::Reject(rejection, None),
     };
-    if reply.length == 8 {
-        return Attachment::Reject(reply.bytes[..8].try_into().expect("eight-byte reply"), None);
-    }
     // Do not append a rejection after any success bytes have been offered.
-    if let Err(error) = setup(socket.write_all(&reply.bytes), deadline, stop).await {
+    if let Err(error) = setup(socket.write_all(&reply), deadline, stop).await {
         return Attachment::Ended(Err(error));
     }
-    Attachment::Ended(forward(socket, &mut reply.upstream, stop).await)
+    Attachment::Ended(forward(socket, &mut upstream, stop).await)
 }
 
 async fn forward(
@@ -514,32 +488,21 @@ async fn forward(
     let (mut downstream_read, mut downstream_write) = socket.split();
     let (mut upstream_read, mut upstream_write) = upstream.split();
     // A half-close ends the attachment, rather than waiting indefinitely for
-    // the other direction. Each copy uses bounded storage and backpressure.
+    // the other direction. Each copy uses a bounded buffer and backpressure,
+    // and returns at EOF without shutting down its writer.
     tokio::select! {
         biased;
         () = stopped(stop) => Ok(()),
-        result = relay(&mut downstream_read, &mut upstream_write) => result,
-        result = relay(&mut upstream_read, &mut downstream_write) => result,
-    }
-}
-
-async fn relay(
-    reader: &mut (impl AsyncRead + Unpin),
-    writer: &mut (impl AsyncWrite + Unpin),
-) -> io::Result<()> {
-    let mut buffer = [0; 4096];
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            return Ok(());
-        }
-        writer.write_all(&buffer[..read]).await?;
+        result = tokio::io::copy(&mut downstream_read, &mut upstream_write) => result.map(|_| ()),
+        result = tokio::io::copy(&mut upstream_read, &mut downstream_write) => result.map(|_| ()),
     }
 }
 
 async fn device_list(backend: SocketAddr, policy: &Policy) -> io::Result<Vec<u8>> {
     let mut upstream = TcpStream::connect(backend).await?;
-    upstream.write_all(&DEVLIST).await?;
+    upstream
+        .write_all(&OpHeader::DEVLIST_REQUEST.encode())
+        .await?;
     decode_device_list(&mut upstream, policy).await
 }
 
@@ -547,28 +510,29 @@ async fn decode_device_list(
     reader: &mut (impl AsyncRead + Unpin),
     policy: &Policy,
 ) -> io::Result<Vec<u8>> {
-    let mut header = [0; 8];
+    let mut header = [0; usbip::HEADER_BYTES];
     reader.read_exact(&mut header).await?;
-    if header[..4] != [1, 0x11, 0, 5] {
-        return Err(invalid("invalid native USB/IP device-list reply"));
-    }
-    if header[4..8] != [0; 4] {
+    let status = OpHeader::parse(header)
+        .filter(|reply| reply.code == OpCode::RepDevlist)
+        .ok_or_else(|| invalid_data("invalid native USB/IP device-list reply"))?
+        .status;
+    if status != usbip::ST_OK {
         return Ok(header.to_vec());
     }
     let count = reader.read_u32().await?;
     if count > MAX_DEVICES {
-        return Err(invalid("USB/IP device list exceeds 1024 devices"));
+        return Err(invalid_data("USB/IP device list exceeds 1024 devices"));
     }
     let mut reply = header.to_vec();
     reply.extend_from_slice(&[0; 4]);
     let mut selected = 0_u32;
     for _ in 0..count {
-        let mut device = [0; DEVICE_BYTES];
+        let mut device = [0; usbip::DEVICE_BYTES];
         reader.read_exact(&mut device).await?;
-        let id: &[u8; 32] = device[256..288].try_into().expect("32-byte native BUSID");
-        let permitted = policy.permits(busid(id)?);
-        let length = usize::from(device[311]) * 4;
-        let mut interfaces = [0; 255 * 4];
+        let record = DeviceRecord::new(&device);
+        let permitted = policy.permits(record.busid()?);
+        let length = record.interface_bytes();
+        let mut interfaces = [0; usbip::MAX_INTERFACE_BYTES];
         reader.read_exact(&mut interfaces[..length]).await?;
         if permitted {
             reply.extend_from_slice(&device);
@@ -576,7 +540,8 @@ async fn decode_device_list(
             selected += 1;
         }
     }
-    reply[8..12].copy_from_slice(&selected.to_be_bytes());
+    // The device count follows the header.
+    reply[usbip::HEADER_BYTES..usbip::HEADER_BYTES + 4].copy_from_slice(&selected.to_be_bytes());
     Ok(reply)
 }
 

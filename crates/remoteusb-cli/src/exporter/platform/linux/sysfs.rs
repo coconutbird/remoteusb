@@ -4,6 +4,8 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use crate::usbip::BusId;
+
 pub(super) const DEVICES: &str = "/sys/bus/usb/devices";
 pub(super) const DRIVERS: &str = "/sys/bus/usb/drivers";
 
@@ -29,13 +31,11 @@ pub(super) struct Snapshot {
 
 // Read actual USB device records, not interface symlinks or root hubs. Linux
 // imports on vhci_hcd cannot be exported again (the usbip tool rejects loops).
-pub(super) fn device_busid(busid: &str) -> bool {
-    let Some((bus, ports)) = busid.split_once('-') else {
+pub(super) fn device_busid(busid: BusId) -> bool {
+    let Some((bus, ports)) = busid.as_str().split_once('-') else {
         return false;
     };
-    numeric_component(bus)
-        && ports.split('.').all(numeric_component)
-        && crate::inventory::validate_busid(busid).is_ok()
+    numeric_component(bus) && ports.split('.').all(numeric_component)
 }
 
 fn numeric_component(value: &str) -> bool {
@@ -58,14 +58,14 @@ fn interface_name(busid: &str, name: &str) -> bool {
             .all(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
-pub(super) async fn snapshot(root: &Path, busid: &str) -> io::Result<Snapshot> {
+pub(super) async fn snapshot(root: &Path, busid: BusId) -> io::Result<Snapshot> {
     if !device_busid(busid) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "not a Linux USB device BUSID",
         ));
     }
-    let path = fs::canonicalize(root.join(busid))?;
+    let path = fs::canonicalize(root.join(busid.as_str()))?;
     if path.components().any(|component| {
         component
             .as_os_str()
@@ -112,7 +112,7 @@ pub(super) async fn snapshot(root: &Path, busid: &str) -> io::Result<Snapshot> {
         let name = entry.file_name().into_string().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 USB interface name")
         })?;
-        if interface_name(busid, &name) {
+        if interface_name(busid.as_str(), &name) {
             interfaces.insert(name, driver(&entry.path())?);
             if interfaces.len() > 256 {
                 return Err(io::Error::new(
@@ -129,7 +129,7 @@ pub(super) async fn snapshot(root: &Path, busid: &str) -> io::Result<Snapshot> {
     let snapshot = Snapshot {
         identity,
         device: crate::inventory::Device {
-            busid: busid.to_owned(),
+            busid,
             vendor,
             product,
             name: super::super::device_name(&name),
@@ -147,7 +147,7 @@ pub(super) async fn snapshot(root: &Path, busid: &str) -> io::Result<Snapshot> {
 
 impl Snapshot {
     pub(super) async fn check(&self, root: &Path) -> io::Result<()> {
-        let path = fs::canonicalize(root.join(&self.device.busid)).map_err(|error| {
+        let path = fs::canonicalize(root.join(self.device.busid.as_str())).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!(
@@ -267,10 +267,17 @@ fn hexadecimal(value: &str) -> io::Result<u16> {
 mod tests {
     use super::*;
 
+    /// The BUSID `fixture` creates.
+    fn busid() -> BusId {
+        "1-2".parse().unwrap()
+    }
+
     #[test]
     fn busids_exclude_interfaces_hubs_and_path_traversal() {
+        // Inventory skips names that are not BUSIDs or not device records.
+        let device = |name: &str| name.parse::<BusId>().is_ok_and(device_busid);
         for valid in ["1-2", "12-3.4.5"] {
-            assert!(device_busid(valid));
+            assert!(device(valid));
         }
         for invalid in [
             "usb1",
@@ -282,7 +289,7 @@ mod tests {
             "1-2/driver",
             "01-2",
         ] {
-            assert!(!device_busid(invalid));
+            assert!(!device(invalid));
         }
     }
 
@@ -348,7 +355,7 @@ mod tests {
         fs::create_dir(&first).unwrap();
         symlink(drivers.join("custom-storage"), first.join("driver")).unwrap();
         fs::create_dir(device.join("1-2:1.1")).unwrap();
-        let state = snapshot(root.path(), "1-2").await.unwrap();
+        let state = snapshot(root.path(), busid()).await.unwrap();
         assert_eq!(state.driver.as_deref(), Some("usb"));
         assert_eq!(
             state.interfaces.get("1-2:1.0"),
@@ -367,20 +374,20 @@ mod tests {
         fs::create_dir(&driver).unwrap();
         symlink(&driver, device.join("driver")).unwrap();
         fs::write(device.join("usbip_status"), "1\n").unwrap();
-        let available = snapshot(root.path(), "1-2").await.unwrap();
+        let available = snapshot(root.path(), busid()).await.unwrap();
         assert!(available.device.shared);
         assert!(!available.device.busy);
         fs::write(device.join("usbip_status"), "2\n").unwrap();
-        assert!(snapshot(root.path(), "1-2").await.unwrap().device.busy);
+        assert!(snapshot(root.path(), busid()).await.unwrap().device.busy);
         fs::write(device.join("usbip_status"), "invalid").unwrap();
-        assert!(snapshot(root.path(), "1-2").await.is_err());
+        assert!(snapshot(root.path(), busid()).await.is_err());
     }
 
     #[tokio::test]
     async fn identity_rejects_busid_reuse_even_same_hardware_and_serial() {
         let root = tempfile::tempdir().unwrap();
         let device = fixture(root.path());
-        let original = snapshot(root.path(), "1-2").await.unwrap();
+        let original = snapshot(root.path(), busid()).await.unwrap();
         fs::rename(&device, root.path().join("old")).unwrap();
         fixture(root.path());
         assert!(original.check(root.path()).await.is_err());
@@ -390,10 +397,10 @@ mod tests {
     async fn identity_rejects_reenumeration_and_hubs() {
         let root = tempfile::tempdir().unwrap();
         let device = fixture(root.path());
-        let original = snapshot(root.path(), "1-2").await.unwrap();
+        let original = snapshot(root.path(), busid()).await.unwrap();
         fs::write(device.join("devnum"), "4").unwrap();
         assert!(original.check(root.path()).await.is_err());
         fs::write(device.join("bDeviceClass"), "09").unwrap();
-        assert!(snapshot(root.path(), "1-2").await.is_err());
+        assert!(snapshot(root.path(), busid()).await.is_err());
     }
 }

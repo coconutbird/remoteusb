@@ -10,7 +10,8 @@ use tokio::sync::oneshot;
 
 use super::proxy::Proxy;
 use super::status::{endpoint_present, stopped_count};
-use super::{independent_process, port, validate_busid};
+use super::{client_busid, independent_process, port};
+use crate::usbip::BusId;
 
 const DRIVER_TIMEOUT: Duration = Duration::from_secs(30);
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -39,7 +40,7 @@ impl From<io::Error> for CommandFailure {
 }
 
 struct Settings {
-    busid: String,
+    busid: BusId,
     executable: PathBuf,
     address: SocketAddr,
 }
@@ -52,7 +53,7 @@ impl Settings {
                 "supervisor requires BUSID, USB/IP executable and loopback address",
             )
         })?;
-        validate_busid(&busid)?;
+        let busid = client_busid(&busid)?;
         let address: SocketAddr = address.parse().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -87,7 +88,7 @@ impl Settings {
                 "--remote".into(),
                 endpoint.ip().to_string(),
                 "--bus-id".into(),
-                self.busid.clone(),
+                self.busid.to_string(),
                 "--once".into(),
                 "--terse".into(),
             ])
@@ -114,7 +115,7 @@ impl Settings {
                 "--remote".into(),
                 endpoint.ip().to_string(),
                 "--bus-id".into(),
-                self.busid.clone(),
+                self.busid.to_string(),
                 "--stop".into(),
             ])
             .await
@@ -132,7 +133,7 @@ impl Settings {
                 }
                 if *canceled {
                     let output = self.command(&["port".into()]).await.map_err(|failure| failure.error)?;
-                    if !endpoint_present(&output.stdout, endpoint, &self.busid)? {
+                    if !endpoint_present(&output.stdout, endpoint, self.busid)? {
                         return Ok(());
                     }
                 }
