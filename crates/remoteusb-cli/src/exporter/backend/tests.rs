@@ -484,7 +484,7 @@ async fn management_capacity_and_shutdown_cover_stalled_requests() {
         async {
             let _ = stopped.await;
         },
-        1,
+        remoteusb_transport::QueueCapacity::MIN,
         WAIT,
     ));
     let mut stalled = TcpStream::connect(address).await.unwrap();

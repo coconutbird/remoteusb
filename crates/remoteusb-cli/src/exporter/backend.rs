@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use remoteusb_transport::QueueCapacity;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -170,13 +171,13 @@ pub(super) async fn run<H: DeviceHost>(
     backend: SocketAddr,
     allowed: Option<BTreeSet<BusId>>,
     shutdown: impl Future<Output = ()>,
-    max_connections: usize,
+    max_connections: QueueCapacity,
     setup_timeout: Duration,
 ) -> io::Result<()> {
-    if max_connections == 0 || setup_timeout.is_zero() {
+    if setup_timeout.is_zero() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "managed backend requires positive limits",
+            "managed backend requires a positive setup timeout",
         ));
     }
     if !listener.local_addr()?.ip().is_loopback()
@@ -206,7 +207,7 @@ pub(super) async fn run<H: DeviceHost>(
                     break;
                 }
             },
-            connection = listener.accept(), if sessions.len() < max_connections => {
+            connection = listener.accept(), if sessions.len() < max_connections.get() => {
                 match connection {
                     Ok((socket, _)) => {
                         let host = host.clone();

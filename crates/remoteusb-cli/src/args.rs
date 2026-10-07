@@ -2,12 +2,12 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use remoteusb_transport::{Connection, Limits, PeerConfig};
+use remoteusb_transport::{Connection, Limits, PeerConfig, QueueCapacity};
 
 use crate::usbip::BusId;
 
@@ -79,8 +79,8 @@ pub(super) struct CommonArgs {
     /// Force relay mode; requires --rendezvous.
     #[arg(long, requires = "rendezvous")]
     pub relay_only: bool,
-    #[arg(long, default_value = "64")]
-    pub max_connections: NonZeroUsize,
+    #[arg(long, default_value = "64", value_parser = capacity)]
+    pub max_connections: QueueCapacity,
     #[arg(long, default_value = "10")]
     pub connect_timeout_secs: NonZeroU64,
 }
@@ -230,11 +230,16 @@ impl CommonArgs {
             peer_cert: credentials.join(format!("{peer}.pem")),
             connection,
             limits: Limits {
-                max_connections: self.max_connections.get(),
+                max_connections: self.max_connections,
                 connect_timeout: Duration::from_secs(self.connect_timeout_secs.get()),
             },
         })
     }
+}
+
+fn capacity(text: &str) -> Result<QueueCapacity, String> {
+    let value: usize = text.parse().map_err(|error| format!("{error}"))?;
+    QueueCapacity::try_from(value).map_err(|error| error.to_string())
 }
 
 impl EndpointArgs {

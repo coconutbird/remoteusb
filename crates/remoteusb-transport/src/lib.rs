@@ -13,8 +13,8 @@
 //! Membership gossip is not used: the native network router retains only bounded
 //! routing/packet state, and its bounded unused coordination inbox is never
 //! decoded into application or replicated membership metadata.
-//! Every link is reliable TCP, so tunnel flow control is a fixed bounded window
-//! sized for long-latency USB/IP round trips rather than a second congestion loop.
+//! Groupnet owns tunnel flow control (slow start over a bounded window);
+//! remoteusb sizes shared drop-on-full queues for every admitted stream.
 
 mod config;
 mod fabric;
@@ -29,33 +29,20 @@ use groupnet::connectivity::{TcpRendezvous, TcpRendezvousConfig};
 use groupnet::core::NodeId;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tokio::time::sleep;
 
 pub use config::{Connection, Limits, PeerConfig};
+pub use groupnet::transport::QueueCapacity;
 
-/// The protocol contract for peers built directly on Groupnet.
-///
-/// Both endpoints must exchange [`PREAMBLE`](wire::PREAMBLE) inside pinned TLS
-/// and use identical [`tunnel_limits`](wire::tunnel_limits): a peer with a
-/// smaller segment bound discards remoteusb segments and cannot complete TLS.
+/// The protocol contract for peers built directly on Groupnet: both endpoints
+/// exchange [`PREAMBLE`](wire::PREAMBLE) inside pinned TLS before any USB/IP
+/// byte. Groupnet tunnels accept any peer segment size, so custom peers may use
+/// their own tunnel limits.
 pub mod wire {
-    use groupnet::network::tunnel::TunnelLimits;
-
-    use crate::Limits;
-    use crate::flow::StreamWindow;
-
     pub use crate::session::PREAMBLE;
-
-    /// Tunnel limits remoteusb applies for the given endpoint bounds.
-    #[must_use]
-    pub fn tunnel_limits(limits: &Limits) -> TunnelLimits {
-        StreamWindow::USB.tunnel_limits(limits)
-    }
 }
 
 use config::{invalid_input, invalid_ip, network_key, validate_ids};
-use fabric::POLL;
-use flow::StreamWindow;
+use flow::frame_queue;
 use session::{Exporter, Receiver, TaskStatus, serve};
 
 /// Forwards authorized Groupnet ordered streams to a loopback USB/IP backend.
@@ -148,7 +135,7 @@ async fn client(
 /// The relay carries Groupnet ciphertext, not plaintext USB/IP. Only the explicit
 /// nonempty node allowlist and shared key are admitted; there is no open mode.
 /// The assigned address is logged, including an ephemeral port when requested.
-/// Relay queues use the same stream window as endpoints.
+/// Relay queues use the same per-stream sizing as endpoints.
 ///
 /// # Errors
 /// Returns an invalid key, invalid/duplicate IDs, invalid listen address, bind
@@ -170,21 +157,20 @@ pub async fn run_rendezvous(
         network_key(key)?,
         peers.into_iter().map(NodeId::new).collect(),
         TcpRendezvousConfig {
-            session_queue: StreamWindow::USB.frame_queue(&Limits::default()),
+            session_queue: frame_queue(&Limits::default()),
             ..TcpRendezvousConfig::default()
         },
     )
     .await?;
     eprintln!("Groupnet rendezvous listener: {}", rendezvous.local_addr()?);
     tokio::pin!(shutdown);
-    let result = loop {
-        tokio::select! {
-            biased;
-            () = &mut shutdown => break Ok(()),
-            () = sleep(POLL) => {
-                if let Err(error) = rendezvous.local_addr() { break Err(error); }
-            }
-        }
+    let result = tokio::select! {
+        biased;
+        () = &mut shutdown => Ok(()),
+        () = rendezvous.closed() => Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "Groupnet rendezvous closed",
+        )),
     };
     rendezvous.close().await;
     result

@@ -345,6 +345,7 @@ dependencies = [
  "bytes",
  "groupnet-core",
  "groupnet-network",
+ "groupnet-transport",
  "ring",
  "tokio",
  "tokio-util",

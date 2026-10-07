@@ -231,7 +231,7 @@ pub(crate) async fn serve<R: Role>(
                 status.update(tasks.len());
                 if let Err(error) = finished(result) { break Err(error); }
             }
-            accepted = role.accept(fabric.link()), if tasks.len() < config.limits.max_connections => {
+            accepted = role.accept(fabric.link()), if tasks.len() < config.limits.max_connections.get() => {
                 match accepted {
                     Ok(Some(incoming)) => {
                         tasks.spawn(forward::<R>(fabric.link().clone(), incoming, config.limits.connect_timeout));

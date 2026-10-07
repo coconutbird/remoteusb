@@ -1,6 +1,7 @@
 //! One exclusive peer's Groupnet network, its TCP connectivity and liveness.
 
 use std::io;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use groupnet::connectivity::{PathPolicy, TcpPunchConfig};
 use groupnet::core::NodeId;
 use groupnet::network::tunnel::TunneledStream;
 use groupnet::network::{Network, NetworkConfig, RouterConfig};
+use groupnet::transport::QueueCapacity;
 use groupnet::transport::admission::{AcceptedPeer, Admission, JoinRequest};
 use groupnet::transport::bulk::BulkTransport;
 use groupnet::transport::link::LinkFuture;
@@ -16,10 +18,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout_at};
 
 use crate::config::{Connection, PeerConfig, network_key};
-use crate::flow::StreamWindow;
-
-/// Cadence for liveness checks on handles that expose no closure notification.
-pub(crate) const POLL: Duration = Duration::from_millis(25);
+use crate::flow::frame_queue;
 
 pub(crate) fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, "Groupnet fabric closed")
@@ -87,19 +86,24 @@ impl Link {
         );
     }
 
-    /// Waits until connectivity and routing both reach the peer.
+    /// Waits until connectivity and routing both reach the peer, woken by
+    /// Groupnet's path and route notifications rather than polling.
     pub(crate) async fn route_ready(&self) -> io::Result<()> {
+        let router = self.network.router();
+        let mut reachable = router.reachable();
+        let mut paths = self.tcp.path_changes().ok_or_else(closed)?;
         loop {
-            self.tcp.local_addrs()?;
-            if self.network.router().is_closed() {
+            if router.is_closed() {
                 return Err(closed());
             }
-            if self.tcp.path_to(&self.peer).is_some()
-                && self.network.router().route_to(&self.peer).is_some()
-            {
+            if self.tcp.path_to(&self.peer).is_some() && router.route_to(&self.peer).is_some() {
                 return Ok(());
             }
-            sleep(POLL).await;
+            tokio::select! {
+                () = router.cancelled() => return Err(closed()),
+                changed = reachable.changed() => changed.map_err(|_| closed())?,
+                changed = paths.changed() => changed?,
+            }
         }
     }
 
@@ -151,7 +155,7 @@ impl Fabric {
         let tunnels = config.tunnels()?;
         let peer = config.peer_node();
         let deadline = Instant::now() + config.limits.connect_timeout;
-        let frames = StreamWindow::USB.frame_queue(&config.limits);
+        let frames = frame_queue(&config.limits);
         let tcp = within(deadline, connectivity(config, &peer, frames)).await?;
         let started = within(
             deadline,
@@ -162,7 +166,7 @@ impl Fabric {
                     max_transports: 1,
                     // Unused coordination messages are bounded and never decoded
                     // by a membership engine or retained as replicated metadata.
-                    message_queue: 1,
+                    message_queue: QueueCapacity::MIN,
                     tunnel_queue: frames,
                     link_queue: frames,
                     ..RouterConfig::default()
@@ -214,15 +218,9 @@ impl Fabric {
     }
 
     pub(crate) async fn closed(&self) {
-        loop {
-            tokio::select! {
-                () = self.link.network.router().cancelled() => return,
-                () = sleep(POLL) => {
-                    if self.link.tcp.local_addrs().is_err() {
-                        return;
-                    }
-                }
-            }
+        tokio::select! {
+            () = self.link.network.router().cancelled() => {}
+            () = self.link.tcp.closed() => {}
         }
     }
 
@@ -247,7 +245,7 @@ impl Drop for Fabric {
 async fn connectivity(
     config: &PeerConfig,
     peer: &NodeId,
-    frames: usize,
+    frames: QueueCapacity,
 ) -> io::Result<TcpMsgTransport> {
     match &config.connection {
         Connection::Direct { bind, .. } => {
@@ -255,7 +253,7 @@ async fn connectivity(
                 config.local_node(),
                 *bind,
                 TcpMsgConfig {
-                    max_outbound: 1,
+                    max_outbound: NonZeroUsize::MIN,
                     // Match native connectivity's pre-allocation frame bound.
                     max_frame_bytes: groupnet::connectivity::MAX_TCP_MESSAGE,
                     outbound_queue: frames,

@@ -29,10 +29,11 @@ The toolchain is pinned to the version used to verify this project.
 - Keep each function below 200 lines. Use rustfmt defaults.
 - No avoidable allocation or copying in the transfer path. Keep memory bounded,
   use backpressure, and never buffer an entire peer-controlled transfer.
-- Size every queue on a stream's path from the one flow policy in
-  `remoteusb-transport/src/flow.rs`. Links are reliable TCP: a local drop is seen
-  as loss and triggers retransmission backoff, so no queue may drop a full window.
-  Changing segment size or the preamble is a wire-protocol change for both peers.
+- Groupnet owns tunnel flow control. Size every drop-on-full queue on a stream's
+  path from `remoteusb-transport/src/flow.rs`, derived from Groupnet's per-session
+  packet queue for every admitted stream: a local drop is seen as loss and halves
+  the window. Use Groupnet's route, path and closure notifications; never poll.
+  Changing the preamble is a wire-protocol change for both peers.
 - Validate at the boundary into types (e.g. `BusId`, typed USB/IP headers) and
   keep one owner per wire format or policy. Use traits for genuine alternative
   implementations (endpoint roles, OS device hosts), not single-use indirection.

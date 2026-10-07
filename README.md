@@ -94,15 +94,17 @@ half-closes. Setup deadlines do not become device idle timeouts. No broken USB
 stream is silently reconnected. An attached receiver exits and requests cleanup
 when its device stream ends; a plain `connect` listener can serve multiple streams.
 
-Every Groupnet link remoteusb uses is reliable TCP (direct, punched or relayed),
-so TCP owns congestion control. Each stream gets a fixed bounded window of 2 MiB
-per direction in 32 KiB segments, and every queue on the path holds a full window
-without dropping. Earlier releases used Groupnet's control-plane defaults (16 KiB
-in flight, growing from 2 KiB) and dropped segments locally under USB bursts; the
-resulting retransmission backoff made Internet-latency storage practically
-unusable. Wire protocol version 2 marks this change: **update both endpoints**.
-A version 1 peer cannot complete the TLS handshake with a version 2 peer and
-fails after the setup deadline.
+Groupnet owns tunnel flow control: slow start over a bounded 64-segment window
+of 16 KiB segments, RFC 6298 retransmission timing, and receive limits that
+accept any peer segment size. remoteusb sets only its admission bounds and sizes
+every drop-on-full queue (router link and tunnel queues, TCP and punch outbound
+queues) to hold Groupnet's per-session packet queue for every admitted stream,
+so a full window is never dropped locally and mistaken for congestion. Earlier
+Groupnet defaults (16 KiB in flight, growing one 512-byte segment per round trip)
+plus local drops made Internet-latency storage practically unusable. Wire
+protocol version 2 marks the remoteusb change; **update both endpoints**. A
+version 1 peer cannot complete the TLS handshake with a version 2 peer and fails
+after the setup deadline.
 
 The workspace uses Rust 2024 and resolver 3. Dependency direction is
 `remoteusb-cli -> remoteusb-transport -> Groupnet`; existing USB/IP driver policy

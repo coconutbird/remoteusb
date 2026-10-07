@@ -22,9 +22,10 @@ use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
-use remoteusb_transport::wire::{PREAMBLE as MARKER, tunnel_limits};
+use remoteusb_transport::wire::PREAMBLE as MARKER;
 use remoteusb_transport::{
-    Connection, Limits, PeerConfig, run_client, run_client_with_status, run_rendezvous, run_server,
+    Connection, Limits, PeerConfig, QueueCapacity, run_client, run_client_with_status,
+    run_rendezvous, run_server,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -145,8 +146,7 @@ impl Certificates {
                 identity.key_der.clone(),
             )?,
             [PeerIdentity::new(NodeId::new("exporter"), &pin.der)?],
-        )
-        .with_limits(tunnel_limits(&Limits::default())))
+        ))
     }
 }
 
@@ -652,7 +652,7 @@ async fn monitored_setup_timeout_cancellation_and_validation_reset_counts() -> T
     assert_eq!(*count.borrow(), 0);
 
     let (status, count) = watch::channel(99);
-    config.limits.max_connections = 0;
+    config.limits.connect_timeout = Duration::ZERO;
     assert!(
         run_client_with_status(listener().await?, config, std::future::pending(), status)
             .await
@@ -876,9 +876,9 @@ async fn ten_concurrent_streams_exceed_groupnet_default_per_peer_limit() -> Test
     let certificates = Certificates::new()?;
     let relay = rendezvous().await?;
     let mut server_config = certificates.config(relay.local_addr()?, true, true);
-    server_config.limits.max_connections = 10;
+    server_config.limits.max_connections = QueueCapacity::of(10);
     let mut client_config = certificates.config(relay.local_addr()?, false, true);
-    client_config.limits.max_connections = 10;
+    client_config.limits.max_connections = QueueCapacity::of(10);
     let (server, backend) = start_server(server_config).await?;
     let client = start_client(client_config).await?;
     let mut locals = Vec::new();
@@ -921,9 +921,9 @@ async fn capacity_blocks_extra_backend_until_first_stream_finishes() -> TestResu
     let certificates = Certificates::new()?;
     let relay = rendezvous().await?;
     let mut server_config = certificates.config(relay.local_addr()?, true, true);
-    server_config.limits.max_connections = 1;
+    server_config.limits.max_connections = QueueCapacity::MIN;
     let mut client_config = certificates.config(relay.local_addr()?, false, true);
-    client_config.limits.max_connections = 1;
+    client_config.limits.max_connections = QueueCapacity::MIN;
     let (server, backend) = start_server(server_config).await?;
     let client = start_client(client_config).await?;
     let mut first = TcpStream::connect(client.address).await?;
@@ -1001,13 +1001,12 @@ async fn plaintext_boundaries_and_configuration_are_validated_before_network_io(
         .await
         .expect_err("public plaintext listener accepted");
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    for variant in 0..5 {
+    for variant in 0..4 {
         let mut invalid = config.clone();
         match variant {
             0 => invalid.peer_id.clone_from(&invalid.local_id),
-            1 => invalid.limits.max_connections = 0,
-            2 => invalid.limits.connect_timeout = Duration::ZERO,
-            3 => {
+            1 => invalid.limits.connect_timeout = Duration::ZERO,
+            2 => {
                 if let Connection::Rendezvous { address, .. } = &mut invalid.connection {
                     *address = "0.0.0.0:7443".parse()?;
                 }

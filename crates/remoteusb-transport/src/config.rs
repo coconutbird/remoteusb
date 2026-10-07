@@ -10,15 +10,16 @@ use groupnet::connectivity::NetworkKey;
 use groupnet::core::NodeId;
 use groupnet::network::TunnelConfig;
 use groupnet::network::tunnel::{PeerIdentity, TlsIdentity};
+use groupnet::transport::QueueCapacity;
 use rustls::pki_types::CertificateDer;
 
-use crate::flow::StreamWindow;
+use crate::flow::tunnel_limits;
 
 /// Bounds concurrent sessions and connection establishment, never idle USB devices.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     /// Maximum connection tasks and node-wide/per-peer sessions, including setup.
-    pub max_connections: usize,
+    pub max_connections: QueueCapacity,
     /// Deadline for fabric admission and each stream's complete setup exchange.
     pub connect_timeout: Duration,
 }
@@ -26,7 +27,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_connections: 64,
+            max_connections: QueueCapacity::of(64),
             connect_timeout: Duration::from_secs(10),
         }
     }
@@ -81,16 +82,12 @@ pub struct PeerConfig {
 impl PeerConfig {
     pub(crate) fn validate(&self) -> io::Result<()> {
         validate_ids(&[self.local_id.as_str(), self.peer_id.as_str()])?;
-        if self.limits.max_connections == 0
-            || self.limits.max_connections > tokio::sync::Semaphore::MAX_PERMITS
-            || self.limits.connect_timeout.is_zero()
+        if self.limits.connect_timeout.is_zero()
             || tokio::time::Instant::now()
                 .checked_add(self.limits.connect_timeout)
                 .is_none()
         {
-            return Err(invalid_input(
-                "invalid connection capacity or setup timeout",
-            ));
+            return Err(invalid_input("invalid setup timeout"));
         }
         match &self.connection {
             Connection::Direct { bind, peer } => {
@@ -152,7 +149,7 @@ impl PeerConfig {
                 .to_vec(),
         )?;
         let peer = certificates(&self.peer_cert)?;
-        let limits = StreamWindow::USB.tunnel_limits(&self.limits);
+        let limits = tunnel_limits(&self.limits);
         limits.validate()?;
         Ok(TunnelConfig::new(
             identity,
