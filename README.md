@@ -4,8 +4,9 @@
 [Groupnet](https://github.com/napbat/groupnet): keyed rendezvous, hole punching,
 **direct-preferred connections with relay fallback**, and mutually authenticated
 TLS with exact peer-certificate pins. Existing OS USB/IP tools and drivers still
-export the physical device and emulate the receiving controller. This repository
-does **not** install drivers, change firewalls, bind devices, or attach hardware.
+export the physical device and emulate the receiving controller. remoteusb does
+**not** install drivers, change firewalls, or bind exporting devices. Explicit
+Windows `connect --attach BUSID` invokes the installed receiving client.
 There is no insecure mode or legacy direct-TLS endpoint configuration.
 
 ## Setup guide: start here
@@ -45,7 +46,7 @@ before installing; a listed release is not a hardware-compatibility certificatio
 4. [Isolate and export the device](#2-isolate-and-export-the-yubikey), then run
    `remoteusb serve` on the PC holding the physical YubiKey.
 5. [Start the receiver and attach](#3-start-the-receiver-and-attach) with
-   `remoteusb connect` and the native Windows `usbip.exe` client.
+   `remoteusb connect --attach BUSID` and the installed Windows usbip-win2 driver.
 6. [Check the selected path](#direct-versus-relay-testing-and-endpoint-options).
    Detach the device safely before stopping the tunnel.
 
@@ -314,19 +315,25 @@ remoteusb serve --backend 127.0.0.1:3240 --rendezvous 203.0.113.10:7443 --creden
 
 ### 3. Start the receiver and attach
 
-On the receiving PC, leave the tunnel running:
+On the Windows receiving PC, run in an administrator terminal and leave it running.
+Replace `1-2` with the exported device's BUSID:
 
 ```powershell
-remoteusb connect --listen 127.0.0.1:3240 --rendezvous 203.0.113.10:7443 --credentials .\receiver-credentials
+remoteusb connect --listen 127.0.0.1:13240 --rendezvous 203.0.113.10:7443 --credentials .\receiver-credentials --attach 1-2
 ```
 
-In another administrator terminal use **usbip.exe from usbip-win2**, not
-`usbipd attach --wsl` (which imports into WSL, not native Windows):
+This uses installed **usbip-win2**, not `usbipd attach --wsl`. remoteusb passes the
+actual loopback listener address/port to `usbip.exe`, attaches once, and reports
+the imported port. It finds the tool at `%ProgramFiles%\USBip\usbip.exe`;
+`--usbip "C:\path\usbip.exe"` overrides that location and requires `--attach`.
+Missing drivers, privilege failures, and attachment errors are fatal; there is
+no automatic retry or reattachment. Linux attachment remains manual.
+
+Omit `--attach` to retain a plain tunnel, discover devices, or manage attachment
+yourself. For the listener above, discovery is:
 
 ```powershell
-usbip.exe list -r 127.0.0.1
-# Use the BUSID listed by the remote backend:
-usbip.exe attach -r 127.0.0.1 -b 1-2
+usbip.exe --tcp-port 13240 list --remote 127.0.0.1
 ```
 
 Always point discovery and attach at the **local loopback tunnel**, never the
@@ -334,8 +341,15 @@ real exporter address. Install the normal receiving-side device application/
 driver as needed. Touch the physical YubiKey when the remote application requests
 it; PIN/user verification depends on the application and device mode.
 
-When finished, stop application activity and detach using the imported PORT
-reported by your receiving tool (example port 1):
+With `--attach`, stop application activity and press Ctrl-C: remoteusb detaches
+**only the port returned by its own attach**, then stops the tunnel. It also
+attempts that cleanup if the fabric terminates. Storage still requires a safe
+flush/unmount first. Forced process termination cannot run cleanup; a driver
+timeout or an invalid port response leaves attachment state uncertain and
+requires inspection with `usbip.exe port`.
+
+Without `--attach`, detach manually using the imported PORT (example port 1).
+Unbind on the exporter only when you want to stop sharing:
 
 ```powershell
 usbip.exe detach -p 1
@@ -355,7 +369,7 @@ unbinding an attached device can surprise-remove it.
   relay fallback when direct connectivity cannot be established. Relay fallback
   does not mean reattaching an already broken USB session automatically.
 - For a deterministic relay-path test, add `--relay-only` to **both** the `serve`
-  and `connect` commands above. Run `usbip.exe list -r 127.0.0.1` and inspect the
+  and `connect` commands above. Run `usbip.exe --tcp-port 13240 list -r 127.0.0.1` and inspect the
   successful stream log for `Relay`. Remove the flag and restart both endpoints
   to test direct-preferred mode; `Direct` demonstrates the actual selected path,
   while `Relay` demonstrates fallback. A bound listener or registration alone
@@ -532,9 +546,10 @@ for the authenticator security model. WAN latency, driver behavior, composite or
 isochronous devices, resets, and throughput can differ from local USB. Encryption
 is not a hardware compatibility guarantee.
 
-**Stop application activity, flush/unmount or safely eject storage, and detach
-with the receiving USB/IP tool before stopping either endpoint or relay.**
-Ctrl-C cancels/drains active transport work and closes Groupnet resources; it is
+**Stop application activity and flush/unmount or safely eject storage before
+disconnecting it.** Windows `connect --attach` detaches its owned port on Ctrl-C;
+otherwise detach with the receiving USB/IP tool before stopping the tunnel.
+Shutdown then closes Groupnet resources; it is
 like unplugging a device, not a graceful filesystem unmount. Unexpected loss can
 interrupt authentication or lose data. After any broken stream/restart, inspect
 imported ports, detach stale attachments, and explicitly attach again. No silent

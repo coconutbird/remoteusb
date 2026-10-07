@@ -1,5 +1,6 @@
 //! Foreground command-line entry point for authenticated Groupnet USB/IP streams.
 
+mod attachment;
 mod credentials;
 
 use std::io;
@@ -143,6 +144,14 @@ struct ConnectArgs {
     #[arg(long, default_value = "127.0.0.1:3240")]
     listen: SocketAddr,
 
+    /// Attach this BUSID using installed Windows usbip-win2; detach on shutdown.
+    #[arg(long, value_name = "BUSID")]
+    attach: Option<String>,
+
+    /// Override the installed Windows usbip.exe path (requires --attach).
+    #[arg(long, value_name = "EXE", requires = "attach")]
+    usbip: Option<PathBuf>,
+
     /// Local Groupnet node ID; must be allowlisted by rendezvous.
     #[arg(long, default_value = "receiver")]
     local_id: String,
@@ -202,9 +211,16 @@ async fn execute(command: Command) -> io::Result<()> {
         }
         Command::Connect(args) => {
             require_loopback(args.listen, "--listen")?;
+            let attachment = args
+                .attach
+                .map(|busid| attachment::Attachment::new(busid, args.usbip))
+                .transpose()?;
             let config = args.common.peer_config(args.local_id, args.peer_id, false);
             let listener = bind(args.listen).await?;
-            run_client(listener, config, shutdown).await
+            match attachment {
+                Some(attachment) => attachment.run(listener, config, shutdown).await,
+                None => run_client(listener, config, shutdown).await,
+            }
         }
     };
 

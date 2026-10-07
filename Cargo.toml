@@ -12,8 +12,8 @@ rust-version = "1.99"
 # Each dependency supplies functionality absent from std.
 [workspace.dependencies]
 remoteusb-transport = { path = "crates/remoteusb-transport" }
-# Asynchronous sockets, bounded connection tasks, and shutdown signals.
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# Asynchronous sockets, child-process lifecycle, bounded tasks, and shutdown signals.
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 # Local Groupnet cutover at 82b8595; see README for the sibling checkout layout.
 groupnet = { path = "../../napbat/groupnet/crates/groupnet", default-features = false, features = ["runtime", "tcp-msg", "connectivity"] }
 # Bridge Groupnet futures-IO streams into the bounded Tokio TCP copy path.
