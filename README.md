@@ -5,7 +5,8 @@
 default**; optional keyed rendezvous adds discovery, hole punching and relay
 fallback. Groupnet authenticates streams with mutual TLS and exact certificate
 pins in both modes. Existing OS drivers export and receive physical USB devices.
-remoteusb does **not** install drivers, change firewalls, or bind exporting devices.
+remoteusb does **not** install drivers or change firewalls. The exporter discovers
+connected devices and shares a selected device on demand through installed tools.
 Windows `attach` owns an attachment until the foreground receiver exits; a separate
 supervisor handles detachment even if that receiver is force-killed.
 
@@ -281,24 +282,43 @@ allow the required loopback access and deny non-loopback ingress to raw 3240.
 Never publish raw USB/IP to a LAN or the Internet. Do not disable the firewall or
 other system protections to make sharing work.
 
-In an administrator PowerShell on the PC with the physical key:
+In an administrator PowerShell on the exporting PC, leave this running:
 
 ```powershell
-usbipd list
-# Replace 1-2 with THE YUBIKEY'S BUSID from the list.
-usbipd bind --busid 1-2
+remoteusb serve --credentials .\exporter-credentials
 ```
 
-Binding persists across reboots. Do not bind your management keyboard, network
-adapter, or system disk. Binding/exporting transfers device ownership; exclusive
-attachment is expected, not simultaneous local and remote use. The installed
-usbipd service is the backend on 3240.
+By default **all exportable connected devices are available** to the authorized
+receiver. Startup and `list` do not bind devices. A receiver's attach request
+binds only its selected device. Hubs and disconnected devices are not candidates.
+Newly plugged devices appear on the next discovery request.
 
-Leave this running in another exporter terminal:
+To limit which devices receivers may select:
 
 ```powershell
-remoteusb serve --listen 0.0.0.0:7443 --credentials .\exporter-credentials
+remoteusb serve --pick --credentials .\exporter-credentials
+remoteusb serve --device 1-2 --device 6-3 --credentials .\exporter-credentials
 ```
+
+`--pick` displays a numbered list and accepts comma-separated numbers. An empty
+selection cancels startup. `--device` may be repeated or comma-separated;
+restrictions use BUSIDs, not permanent physical identities. Check them after
+moving/replacing hardware. Binding critical keyboards, network adapters, or
+mounted storage can interrupt the exporting PC; restrict devices when appropriate.
+
+After disconnection, the exporter restores sharing it created for that session.
+Preexisting sharing remains unchanged. The installed USB/IP backend must manage
+these same local devices. Windows uses `usbipd state` and binds without `--force`.
+No interactive elevation, driver installation, or firewall changes occur.
+
+Do not run external bind/unbind commands while remoteusb owns a device session.
+The installed management APIs cannot atomically prove ownership against concurrent
+administrator changes. remoteusb coordinates its own exporter processes with
+per-BUSID OS file locks (`%ProgramData%\\remoteusb\\locks` on Windows,
+`/run/lock/remoteusb` on Linux); the exporter needs permission to create these.
+Lock files contain no credentials and remain after the OS releases their locks.
+Ambiguous mutation/restore results are reported instead of guessing which sharing
+registration may be removed.
 
 The backend defaults to `127.0.0.1:3240`. Allow TCP 7443 in the exporter firewall
 and forward it from the router if needed. `serve` defaults to `0.0.0.0:7443`;
@@ -314,11 +334,20 @@ with the real exporter IP (the example address is documentation-only):
 .\remoteusb.exe attach 203.0.113.10 1-2
 ```
 
-`list` performs USB/IP discovery over an authenticated tunnel and exits; it needs
-no USB/IP driver. `attach` uses installed **usbip-win2**, chooses its loopback port
+`list` reads the exporter's connected-device inventory over an authenticated
+tunnel and exits; it needs no receiving USB/IP driver. Both endpoints must use
+the managed-inventory version of remoteusb. `attach` uses installed **usbip-win2**, chooses its loopback port
 internally, and stays in the foreground. Run attachment in an administrator
 terminal when required by the installed driver. There is no public `detach`
 command: stop device activity and press Ctrl-C in the receiver to detach.
+
+Device listings include `STATUS` (`Available`, `Shared`, or `Busy`) and `NAME`.
+`Available` means eligible for on-demand sharing, not already bound or guaranteed
+compatible. Names use the embedded USB ID database, falling back to the exporter's
+OS description; numeric IDs remain visible. Use BUSID to select an attachment.
+Native USB/IP device-list requests through a plain tunnel can list only already
+shared devices, because unbound devices do not yet have backend USB/IP descriptors.
+Use `remoteusb list` to see all permitted candidates without binding them.
 
 Run discovery before attachment. Use one active receiving process per provisioned
 node identity; a second independent process with the same identity cannot replace
@@ -428,8 +457,7 @@ and other protections enabled. On a Linux exporter:
 sudo modprobe usbip_host
 sudo usbipd -D
 usbip list --local
-sudo usbip bind --busid 1-2
-remoteusb serve --listen 0.0.0.0:7443 --credentials ./exporter-credentials
+sudo remoteusb serve --listen 0.0.0.0:7443 --credentials ./exporter-credentials
 ```
 
 Replace the exporter IP and BUSID as above. If usbipd is already managed by a
@@ -446,12 +474,22 @@ sudo usbip --tcp-port 13240 attach --remote 127.0.0.1 --busid 1-2
 usbip port
 # Replace 0 with the actual local imported port:
 sudo usbip detach --port 0
-# On exporter, only after safe detach:
-sudo usbip unbind --busid 1-2
 ```
 
 Windows and Linux imported port numbers need not match. Mixed-OS and particular
 device/driver combinations need independent qualification.
+
+Linux managed export requires root/device-driver sysfs permissions, installed
+`usbip`, `cat`, and `tee` tools, and an already loaded `usbip_host` module.
+remoteusb does not load modules. Cleanup restores the original USB configuration
+and device/interface drivers when the same
+device identity is still present. Hot unplug/replug or concurrent administrative
+driver changes cannot be made transactional by these OS APIs; identity changes
+produce a cleanup error rather than modifying a replacement device.
+Keep the exporter running until attached sessions have disconnected and cleanup
+finishes. Killing the exporter or losing power can leave sharing behind; inspect
+native USB/IP state before recovery.
+
 
 ## Hardware-free verification
 
@@ -497,6 +535,17 @@ An additional real-driver smoke killed the receiver while an import awaited its
 first reply from a deliberately stalled loopback backend; its supervisor closed
 the sockets and exited without creating a device or retaining a reservation.
 
+Managed export verification passed formatting, strict Clippy, and 74 tests on
+both Windows and Linux. Manual Windows checks verified all-device discovery
+without changing sharing, interactive and explicit restrictions, rejection of
+excluded imports before binding, and inventory over direct and forced-relay paths.
+An explicitly approved YubiKey test started unshared, bound on receiver selection,
+and automatically unshared after receiver force-kill; its original shared state
+was then restored by the operator. The updated release also listed all devices
+through the public IP from inside the LAN. Linux hardware binding is not qualified:
+the available WSL host lacks USB sysfs support, and the actual CLI correctly
+reported that prerequisite rather than starting a nonfunctional exporter.
+
 ## Opt-in real-drive integration test
 
 [`crates/remoteusb-cli/tests/usb-drive.rs`](crates/remoteusb-cli/tests/usb-drive.rs)
@@ -537,11 +586,13 @@ test has not yet qualified a physical drive over relay or an Internet path.
 
 ## Security, shutdown, and troubleshooting
 
-An authorized receiver gains control of **every device exported by the selected
-backend**, not just the BUSID in an example. There are no per-device ACLs or USB
-command filters. Use a dedicated backend/trust domain when different devices
-require different authorization. Loopback is a machine trust boundary, not a
-user boundary: other local users may access the receiver tunnel or raw exporter.
+By default an authorized receiver may select **every exportable connected USB
+device** on the exporter. `serve --device` or `--pick` restricts BUSIDs for all
+receivers admitted by that exporter; it is not a separate policy per certificate.
+Import requests outside the selected set are rejected before binding. USB payloads
+are not inspected or filtered. Raw backend access bypasses this selection policy.
+Loopback is a machine trust boundary, not a user boundary: other local users may
+access the receiver tunnel, privileged management endpoint, or raw exporter.
 Use trusted endpoints or suitable OS isolation. Endpoint compromise defeats
 transport protection; holding a device's private signing keys on the physical
 key does not make an untrusted receiving computer safe. An authorized receiver

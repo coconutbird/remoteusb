@@ -92,6 +92,17 @@ pub(super) struct ServeArgs {
     pub listen: Option<SocketAddr>,
     #[arg(long, default_value = "receiver")]
     pub peer_id: String,
+    /// Make only these BUSIDs available; repeat or separate with commas.
+    #[arg(
+        long = "device",
+        value_name = "BUSID",
+        value_delimiter = ',',
+        conflicts_with = "pick"
+    )]
+    pub devices: Vec<String>,
+    /// Interactively choose which connected devices receivers may attach.
+    #[arg(long)]
+    pub pick: bool,
     #[command(flatten)]
     pub common: CommonArgs,
 }

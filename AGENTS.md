@@ -9,7 +9,8 @@ this repository does not install drivers, change firewalls, or weaken signing.
 
 - `remoteusb-transport`: Groupnet identity/admission, direct and rendezvous
   connectivity, and bounded asynchronous byte forwarding.
-- `remoteusb-cli`: credentials, commands, discovery and receiver/supervisor lifecycle.
+- `remoteusb-cli`: credentials, commands, discovery, on-demand exporter device
+  sharing/policy, and receiver/supervisor lifecycle.
 
 Dependencies point downward. Keep USB driver policy out of the transport layer.
 Do not add a crate until it owns a distinct responsibility.
@@ -52,14 +53,16 @@ The toolchain is pinned to the version used to verify this project.
   and node-wide, as well as local forwarding tasks. Setup deadlines do not become
   idle timeouts for attached USB devices; Groupnet reliability heartbeats remain
   active. Each local TCP connection owns one independent ordered stream.
-- Every authorized certificate grants access to every device exported by the
-  selected backend. Do not claim per-device authorization or payload inspection.
+- Managed exporters expose exportable devices on demand, optionally restricted by
+  BUSID. Enforce selection before binding; restore only sharing owned by the
+  session and never act on a replacement device. Preserve preexisting sharing.
+  All authorized peers share the exporter policy; do not claim payload filtering.
 - No silent USB/IP stream reconnect. Plain tunnels/exporters survive individual
   failed sessions; fabric closure terminates them. An attachment receiver exits
-  when its attached stream ends and asks its supervisor to release its owned port.
-- The independent Windows supervisor owns attach and detach. Parent lifetime is
-  a private pipe, not a reusable PID; losing the parent during attach must still
-  collect the returned port and detach it. Never detach-all or guess ownership.
+  when its attached stream ends and asks its supervisor to close its owned socket.
+- The independent Windows supervisor owns the driver-facing connection and retry
+  cancellation. Parent lifetime is a private pipe, not a reusable PID. Never detach
+  using a saved driver port, detach-all, or guess ownership after port reuse.
 - Shutdown is unplugging, not a graceful filesystem unmount. Killing both owner
   and supervisor or losing power cannot run recovery. Never install drivers or
   alter devices in automated tests.

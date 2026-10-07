@@ -4,13 +4,15 @@ mod args;
 mod attachment;
 mod credentials;
 mod discovery;
+mod exporter;
+mod inventory;
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
 
 use clap::Parser;
-use remoteusb_transport::{Connection, run_client, run_rendezvous, run_server};
+use remoteusb_transport::{run_client, run_rendezvous};
 use tokio::net::TcpListener;
 
 use args::{Cli, Command};
@@ -58,17 +60,7 @@ async fn execute(command: Command) -> io::Result<()> {
             )
             .await
         }
-        Command::Serve(args) => {
-            require_loopback(args.backend, "--backend")?;
-            let direct = Connection::Direct {
-                bind: args
-                    .listen
-                    .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, 7443))),
-                peer: None,
-            };
-            let config = args.common.config(args.peer_id, true, Some(direct))?;
-            run_server(config, args.backend, shutdown).await
-        }
+        Command::Serve(args) => exporter::run(args, shutdown).await,
         Command::Connect(args) => {
             let attachment = args
                 .attach

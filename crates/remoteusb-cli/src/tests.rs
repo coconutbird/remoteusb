@@ -171,6 +171,7 @@ fn incompatible_modes_and_unbounded_limits_are_rejected() {
         ],
         vec!["connect", "192.0.2.1", "--usbip", "usbip.exe"],
         vec!["connect", "192.0.2.1", "--insecure"],
+        vec!["serve", "--pick", "--device", "1-2"],
         vec!["detach", "1"],
     ] {
         let mut command = vec!["remoteusb"];
