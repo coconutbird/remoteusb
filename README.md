@@ -1,13 +1,13 @@
 # remoteusb
 
 `remoteusb` carries USB/IP between trusted Windows or Linux computers using
-[Groupnet](https://github.com/napbat/groupnet): keyed rendezvous, hole punching,
-**direct-preferred connections with relay fallback**, and mutually authenticated
-TLS with exact peer-certificate pins. Existing OS USB/IP tools and drivers still
-export the physical device and emulate the receiving controller. remoteusb does
-**not** install drivers, change firewalls, or bind exporting devices. Explicit
-Windows `connect --attach BUSID` invokes the installed receiving client.
-There is no insecure mode or legacy direct-TLS endpoint configuration.
+[Groupnet](https://github.com/napbat/groupnet). **Direct IP connections are the
+default**; optional keyed rendezvous adds discovery, hole punching and relay
+fallback. Groupnet authenticates streams with mutual TLS and exact certificate
+pins in both modes. Existing OS drivers export and receive physical USB devices.
+remoteusb does **not** install drivers, change firewalls, or bind exporting devices.
+Windows `attach` owns an attachment until the foreground receiver exits; a separate
+supervisor handles detachment even if that receiver is force-killed.
 
 ## Setup guide: start here
 
@@ -42,58 +42,56 @@ before installing; a listed release is not a hardware-compatibility certificatio
    checkout, and install the USB/IP driver/tool for each machine's role.
 2. [Generate credentials once](#generate-credentials-once) in a protected directory.
    [Distribute only the required files](#distribute-the-minimum-files) to each host.
-3. [Start rendezvous](#1-start-rendezvous--relay) on a machine reachable by both PCs.
-4. [Isolate and export the device](#2-isolate-and-export-the-yubikey), then run
+3. [Isolate and export the device](#1-isolate-and-export-the-yubikey), then run
    `remoteusb serve` on the PC holding the physical YubiKey.
-5. [Start the receiver and attach](#3-start-the-receiver-and-attach) with
-   `remoteusb connect --attach BUSID` and the installed Windows usbip-win2 driver.
-6. [Check the selected path](#direct-versus-relay-testing-and-endpoint-options).
-   Detach the device safely before stopping the tunnel.
+4. [List and attach](#2-list-and-attach-from-the-receiver) from the receiving PC.
+5. Stop device activity, then press Ctrl-C in the receiving process to disconnect.
 
 | Role | What runs there | Network requirement |
 | --- | --- | --- |
-| Rendezvous host | `remoteusb rendezvous` | TCP 7443 reachable by both endpoints |
-| Exporter, with physical USB device | `usbipd-win` and `remoteusb serve` | Outbound rendezvous access; direct TCP candidates when permitted |
-| Receiver, where applications use the device | `usbip-win2` and `remoteusb connect` | Outbound rendezvous access; local USB/IP listener on loopback |
+| Exporter | `usbipd-win` and `remoteusb serve` | Direct mode: reachable TCP 7443 |
+| Receiver | `remoteusb list`, `attach`, or `connect`; usbip-win2 for attachment | Outbound access to exporter; internal loopback USB/IP listener |
+| Optional rendezvous host | `remoteusb rendezvous` | Reachable by both endpoints in rendezvous mode |
 
-The rendezvous role may share a machine with an endpoint if it remains reachable.
-Direct traffic bypasses the relay; NAT/firewall restrictions may require relaying.
+With an existing router port forward, point TCP 7443 at the exporting PC.
+Do not forward raw USB/IP port 3240. If direct reachability is unavailable, use
+the [optional rendezvous setup](#optional-rendezvous-and-relay).
 For Linux, use the [Linux export/receive instructions](#linux-export-and-receive).
 Without drivers or hardware, start with the [hardware-free checks](#hardware-free-verification).
 
 ## Architecture and trust boundaries
 
 ```text
-Exporting PC                                      Receiving PC
-physical YubiKey                                 application
-     |                                                |
-USB/IP exporting driver                          USB/IP receiving driver
-     |                                                |
-loopback backend :3240                           loopback listener :3240
-     |                                                |
-remoteusb serve ===== authenticated Groupnet ===== remoteusb connect
-                         direct preferred
-                                |
-                      rendezvous / relay :7443
-                         fallback when needed
+Physical USB → USB/IP exporter → remoteusb serve :7443
+                                        ↕ Groupnet authenticated stream
+Application ← USB/IP receiver ← remoteusb attach IP BUSID
+                                        ↕ private lifetime pipe
+                                 attachment supervisor
 ```
 
-Both endpoints register with the same keyed rendezvous service. Groupnet attempts
-a direct hole-punched link by default, and uses its relay when a direct path is
-unavailable. `--relay-only` explicitly forces the relay for diagnostics. The
-rendezvous service allowlists the two configured node IDs; there is no open
-admission. Sharing the network key is **not** sufficient to impersonate the
-endpoint: TLS must validate the private CA and the exact public peer leaf, and the
-authorized node ID and remoteusb application preamble must match before `serve`
-opens the USB/IP backend. Both certificates use the DNS SAN `groupnet.peer` and
-both TLS server/client EKUs because either endpoint can initiate a Groupnet link.
+Direct mode uses native Groupnet TCP with an explicit peer node allowlist.
+Transport admission metadata is not itself authenticated: **TLS is the device
+access boundary**, with private CA validation, exact peer leaf pins and
+`groupnet.peer` server-name validation. The remoteusb marker/reply exchange
+completes before `serve` opens the USB/IP backend. There is no separate raw-TLS
+socket mode, insecure option, or authentication downgrade.
+An unauthenticated connection claiming the allowlisted node ID can occupy the
+single bounded adjacent-peer slot and deny new direct connections; the allowlist
+does not prove identity or prevent this availability attack. It cannot authorize
+USB access without the pinned TLS credentials. Use keyed rendezvous mode when
+network-key admission is required before a transport peer is accepted.
 
-Each local USB/IP TCP connection maps to one independent Groupnet Ordered stream
-and one exporter backend connection. Discovery and attach use separate streams.
-The transport preserves binary bytes, backpressure, and TCP half-closes. Capacity
-limits include pending stream setup; setup timeouts are **not** idle-device
-timeouts. There is no automatic USB stream reconnection: after a broken connection,
-detach stale imported ports and explicitly attach again.
+Rendezvous mode additionally authenticates discovery/connectivity with a shared
+network key and exact node allowlists. Discovery coordinates direct paths;
+relay fallback actually forwards encrypted traffic. A network key alone cannot
+impersonate an endpoint's pinned TLS identity. Both endpoint certificates need
+client and server EKUs.
+
+Each local USB/IP TCP connection maps to one independent Groupnet ordered stream
+and exporter backend connection. Streams preserve bytes, backpressure and
+half-closes. Setup deadlines do not become device idle timeouts. No broken USB
+stream is silently reconnected. An attached receiver exits and requests cleanup
+when its device stream ends; a plain `connect` listener can serve multiple streams.
 
 The workspace uses Rust 2024 and resolver 3. Dependency direction is
 `remoteusb-cli -> remoteusb-transport -> Groupnet`; existing USB/IP driver policy
@@ -247,14 +245,18 @@ all machines:
 | Machine | Files to copy into its `--credentials` directory |
 | --- | --- |
 | Rendezvous/relay host | **Only `network.key`** |
-| Exporter | `ca.pem`, `exporter.pem`, **`exporter.key`**, `receiver.pem`, **`network.key`** |
-| Receiver | `ca.pem`, `receiver.pem`, **`receiver.key`**, `exporter.pem`, **`network.key`** |
+| Exporter | `ca.pem`, `exporter.pem`, **`exporter.key`**, `receiver.pem`; **`network.key` only for rendezvous mode** |
+| Receiver | `ca.pem`, `receiver.pem`, **`receiver.key`**, `exporter.pem`; **`network.key` only for rendezvous mode** |
 
 The relay does not require or read endpoint TLS private keys or certificates.
 It participates in keyed rendezvous/relay routing; keep the shared network key
 private. Neither endpoint needs the other's private key. Protect deployment
 parents/ACLs before copying on Windows; inspect the key ACLs afterward. On Unix,
 use `chmod 700 DIRECTORY` and `chmod 600 DIRECTORY/*.key`.
+
+By default, credentials are read from a `credentials` directory **beside the
+executable**, independent of the shell's working directory. Override this with
+`--credentials DIR`. An IP address never substitutes for provisioned trust.
 
 Never commit keys, upload them to an issue, or print them into logs. Preserve the
 public peer certificates exactly: replacing a leaf requires updating the opposite
@@ -265,27 +267,12 @@ the required files, and restart endpoints/relay to terminate old sessions.
 
 ## Windows-to-Windows YubiKey setup
 
-These commands assume separate trusted PCs and a reachable rendezvous/relay host.
-Keep a backup login method. Start with a non-critical account/device; actual
-YubiKey, driver, FIDO2/WebAuthn, PIV, OpenPGP, and OTP compatibility is **not**
-hardware-verified by this project. Physical touch must occur at the physical key.
+The default setup needs a directly reachable exporter, not a rendezvous server.
+Keep a backup login method. Physical touch still happens on the physical key.
+Authentication protocols and particular OS/driver/device combinations need
+independent qualification; USB enumeration alone does not prove every key mode.
 
-### 1. Start rendezvous / relay
-
-On a host reachable by both PCs, with only `network.key` in `relay-credentials`:
-
-```powershell
-remoteusb rendezvous --listen 0.0.0.0:7443 --credentials .\relay-credentials --exporter-id exporter --receiver-id receiver
-```
-
-Without `--listen`, rendezvous binds `127.0.0.1:7443` for same-machine testing.
-Public hosting must be explicit. Permit **TCP 7443** in your existing
-firewall/routing policy; if behind NAT, provide reachable forwarding to this host.
-Use an actual numeric address reachable from both endpoints. In the next commands,
-**replace `203.0.113.10`** (documentation-only, not a real relay) with that address.
-DNS names are not accepted by `--rendezvous`; resolve the intended host first.
-
-### 2. Isolate and export the YubiKey
+### 1. Isolate and export the YubiKey
 
 Before binding, restrict raw USB/IP TCP **3240** to the exporter itself.
 `serve` rejects non-loopback `--backend`, but cannot stop `usbipd` from separately
@@ -310,120 +297,127 @@ usbipd service is the backend on 3240.
 Leave this running in another exporter terminal:
 
 ```powershell
-remoteusb serve --backend 127.0.0.1:3240 --rendezvous 203.0.113.10:7443 --credentials .\exporter-credentials
+remoteusb serve --listen 0.0.0.0:7443 --credentials .\exporter-credentials
 ```
 
-### 3. Start the receiver and attach
+The backend defaults to `127.0.0.1:3240`. Allow TCP 7443 in the exporter firewall
+and forward it from the router if needed. `serve` defaults to `0.0.0.0:7443`;
+use `--listen "[::]:7443"` for an IPv6 listener.
 
-On the Windows receiving PC, run in an administrator terminal and leave it running.
-Replace `1-2` with the exported device's BUSID:
+### 2. List and attach from the receiver
+
+Assuming receiver credentials are beside the executable, replace `203.0.113.10`
+with the real exporter IP (the example address is documentation-only):
 
 ```powershell
-remoteusb connect --listen 127.0.0.1:13240 --rendezvous 203.0.113.10:7443 --credentials .\receiver-credentials --attach 1-2
+.\remoteusb.exe list 203.0.113.10
+.\remoteusb.exe attach 203.0.113.10 1-2
 ```
 
-This uses installed **usbip-win2**, not `usbipd attach --wsl`. remoteusb passes the
-actual loopback listener address/port to `usbip.exe`, attaches once, and reports
-the imported port. It finds the tool at `%ProgramFiles%\USBip\usbip.exe`;
-`--usbip "C:\path\usbip.exe"` overrides that location and requires `--attach`.
-Missing drivers, privilege failures, and attachment errors are fatal; there is
-no automatic retry or reattachment. Linux attachment remains manual.
+`list` performs USB/IP discovery over an authenticated tunnel and exits; it needs
+no USB/IP driver. `attach` uses installed **usbip-win2**, chooses its loopback port
+internally, and stays in the foreground. Run attachment in an administrator
+terminal when required by the installed driver. There is no public `detach`
+command: stop device activity and press Ctrl-C in the receiver to detach.
 
-Omit `--attach` to retain a plain tunnel, discover devices, or manage attachment
-yourself. For the listener above, discovery is:
+Run discovery before attachment. Use one active receiving process per provisioned
+node identity; a second independent process with the same identity cannot replace
+an incumbent direct connection. A plain tunnel can still carry multiple local
+USB/IP streams.
+
+The equivalent combined command is:
 
 ```powershell
-usbip.exe --tcp-port 13240 list --remote 127.0.0.1
+.\remoteusb.exe connect 203.0.113.10 --attach 1-2
 ```
 
-Always point discovery and attach at the **local loopback tunnel**, never the
-real exporter address. Install the normal receiving-side device application/
-driver as needed. Touch the physical YubiKey when the remote application requests
-it; PIN/user verification depends on the application and device mode.
+`connect IP` without `--attach` is an advanced foreground byte tunnel, not a
+persistent background session. It prints its automatically allocated loopback
+port; use `--listen 127.0.0.1:13240` if an external client needs a fixed port.
+Targets are numeric IPv4/IPv6 addresses, with optional explicit port; port 7443
+is the default. For example: `203.0.113.10:8443` or `[2001:db8::1]:7443`.
 
-With `--attach`, stop application activity and press Ctrl-C: remoteusb detaches
-**only the port returned by its own attach**, then stops the tunnel. It also
-attempts that cleanup if the fabric terminates. Storage still requires a safe
-flush/unmount first. Forced process termination cannot run cleanup; a driver
-timeout or an invalid port response leaves attachment state uncertain and
-requires inspection with `usbip.exe port`.
+### Attachment ownership and cleanup
 
-Without `--attach`, detach manually using the imported PORT (example port 1).
-Unbind on the exporter only when you want to stop sharing:
+The Windows attachment supervisor is an independent copy of the executable.
+It owns a private loopback proxy, its single driver connection, and the attachment.
+A private pipe tracks receiver lifetime. On Ctrl-C, receiver failure or force-kill,
+the supervisor closes **only its own sockets**, rejects further connections and
+cancels retries for that exact private endpoint. It never detaches by a saved USB
+port number, which Windows could have reassigned to an unrelated device.
+Receiver death during attachment still waits for the attach result before cleanup.
+The foreground receiver waits for confirmed cleanup during controlled shutdown.
+
+There is no automatic reattachment. Missing drivers and privilege failures are
+reported. The default client is `%ProgramFiles%\USBip\usbip.exe`; use
+`--usbip "C:\path\usbip.exe"` with `attach` or `connect --attach` if needed.
+
+usbip-win2's `--once` prevents retries on initial failure, but its disconnect path
+can still schedule reattachment. Cleanup after a potentially successful import
+therefore requires a positive targeted retry-cancellation acknowledgment and
+confirms the private endpoint is no longer imported before releasing its listener.
+An initial failure with no reply, or a valid rejected-import reply, releases only
+after the attach child has finished and owned sockets have closed.
+If driver status/output is ambiguous,
+the supervisor reports failure and keeps that endpoint reserved/rejecting while
+recovery remains pending; it does not falsely report clean detachment or allow
+retries to reach a reused port. See the driver's
+[automatic reattachment behavior](https://github.com/vadimgrn/usbip-win2/wiki/How-automatic-reattachment-works).
+
+This cannot recover from power loss, killing both processes, or an external job
+manager killing the complete process tree. A driver timeout or ambiguous driver
+output can leave unknown attachment state; inspect `usbip.exe port` and use the
+driver's recovery tools. Cleanup is unplugging, **not** a graceful filesystem
+unmount: flush/unmount storage before ending the receiver. To stop exporting
+after a receiver has exited, run `usbipd unbind --busid 1-2` on the exporter.
+
+## Optional rendezvous and relay
+
+When a direct exporter address is unavailable, run keyed rendezvous on a host
+reachable by both peers, then opt both endpoints into it:
 
 ```powershell
-usbip.exe detach -p 1
-# On the exporter, only after detach, to stop sharing:
-usbipd unbind --busid 1-2
-usbipd list
+# Rendezvous host: only network.key is needed.
+remoteusb rendezvous --listen 0.0.0.0:7443 --credentials .\relay-credentials
+# Exporter:
+remoteusb serve --rendezvous 203.0.113.10:7443 --credentials .\exporter-credentials
+# Receiver:
+remoteusb list exporter --rendezvous 203.0.113.10:7443
+remoteusb attach exporter 1-2 --rendezvous 203.0.113.10:7443
 ```
 
-See [usbip-win2 usage](https://github.com/vadimgrn/usbip-win2#use-usbipexe-to-attach-remote-devices)
-for port numbering and syntax. Follow usbipd-win's own
-[unbind behavior](https://github.com/dorssel/usbipd-win/blob/master/Usbipd/Program.cs);
-unbinding an attached device can surprise-remove it.
+With `--rendezvous`, the positional target is the exporter's **node ID**, not
+its IP. Default node IDs are `exporter` and `receiver`. The peers register with
+the same keyed server, prefer a direct punched path, and relay when needed.
+`--relay-only` forces relay mode and requires `--rendezvous`. Direct mode does
+not contact a rendezvous server and does not silently fall back to one.
 
-## Direct versus relay testing and endpoint options
+`--candidate-bind IP:PORT` is rendezvous-only and repeatable up to four times.
+Its default unspecified address matches the rendezvous address family. A public
+direct listener (`serve --listen`) and `--rendezvous` are mutually exclusive.
+If hosting both services on one PC, use different ports. All connectivity is TCP.
 
-- Default mode is **DirectPreferred**: hole punching/direct candidates first,
-  relay fallback when direct connectivity cannot be established. Relay fallback
-  does not mean reattaching an already broken USB session automatically.
-- For a deterministic relay-path test, add `--relay-only` to **both** the `serve`
-  and `connect` commands above. Run `usbip.exe --tcp-port 13240 list -r 127.0.0.1` and inspect the
-  successful stream log for `Relay`. Remove the flag and restart both endpoints
-  to test direct-preferred mode; `Direct` demonstrates the actual selected path,
-  while `Relay` demonstrates fallback. A bound listener or registration alone
-  does not demonstrate stream transfer, hardware compatibility, or a direct path.
-- `--candidate-bind IP:PORT` is repeatable on both endpoints, with up to four
-  binds; the default is `0.0.0.0:0`. The first bind supplies rendezvous registration
-  and source connectivity and must match the rendezvous address family. For an
-  IPv6 rendezvous, explicitly pass `--candidate-bind "[::]:0"`. Additional binds
-  provide retained direct candidate listeners on suitable local interfaces.
-  Candidates, rendezvous, and relay are **TCP-only**, not UDP. Permit the relevant
-  TCP traffic under your existing network policy. NAT/firewall behavior determines
-  whether direct hole punching succeeds; reachable rendezvous/relay is still
-  required for reliable fallback. No fixed public exporter TLS listener or
-  `--remote`/`--server-name` is used.
-- Aliases must agree end to end. For example rendezvous
-  `--exporter-id key-pc --receiver-id work-pc` requires serve
-  `--local-id key-pc --peer-id work-pc` and connect
-  `--local-id work-pc --peer-id key-pc`. Certificate filenames remain
-  exporter/receiver regardless of aliases. Node IDs are exact allowlist entries,
-  not a substitute for CA validation and certificate pins.
-- Both endpoint roles default to `--max-connections 64` and
-  `--connect-timeout-secs 10`; zero is rejected. Limits count streams, including
-  setup, not physical devices. There is no idle timeout for an attached key.
-- Actual rendezvous/listener addresses are logged, including ephemeral ports.
-  Startup/fatal fabric errors cause nonzero exits; individual failed stream
-  attempts are reported. Ctrl-C signal-handler failures are fatal, not silently
-  treated as successful shutdown.
+In direct mode, use `--peer-id` to override the provisioned remote ID. In
+rendezvous mode, the receiver target supplies it; serve still uses `--peer-id`.
+`--local-id` changes the local alias, never certificate filenames. CA checks,
+exact leaf pins, and node allowlists apply regardless of aliases.
 
-### Same-machine testing and port collisions
+Both roles default to 64 concurrent setup/forwarding tasks and a 10-second
+setup deadline (`--max-connections`, `--connect-timeout-secs`). There is no idle
+timeout on an attached device. List operations have a bounded discovery deadline.
+Plain tunnels and exporters survive individual failed streams; supervised
+attachments clean up when their device connection ends.
 
-Use `--rendezvous 127.0.0.1:7443` on both endpoints with the default loopback
-rendezvous for local tests. If an exporter already occupies 3240, `connect` cannot
-bind its default socket on the same machine. Prefer separate PCs. If the backend
-binds **only** `127.0.0.1`, and your OS supports the second loopback IP:
+### Same-machine testing
 
 ```powershell
-remoteusb connect --listen 127.0.0.2:3240 --rendezvous 127.0.0.1:7443 --credentials .\receiver-credentials --relay-only
-usbip.exe list -r 127.0.0.2
-# Use -r 127.0.0.2 for attach too.
+remoteusb serve --listen 127.0.0.1:7443 --credentials .\exporter-credentials
+remoteusb list 127.0.0.1 --credentials .\receiver-credentials
+remoteusb attach 127.0.0.1 1-2 --credentials .\receiver-credentials
 ```
 
-This fails if the backend binds a wildcard address such as `0.0.0.0:3240`, which
-can also occupy the second loopback address; use separate machines in that case.
-Linux tools can instead use another port:
-
-```sh
-remoteusb connect --listen 127.0.0.1:3241 --rendezvous 127.0.0.1:7443 --credentials ./receiver-credentials
-usbip --tcp-port 3241 list --remote 127.0.0.1
-sudo usbip --tcp-port 3241 attach --remote 127.0.0.1 --busid 1-2
-```
-
-Do not assume every Windows receiving-tool release supports custom ports.
-A synthetic loopback backend can exercise transport without driver installation
-or hardware binding, but is not evidence of real USB/IP hardware compatibility.
+The receiver uses an ephemeral loopback port, so the exporting backend can keep
+3240. A synthetic backend proves transport behavior, not physical-device support.
 
 ## Linux export and receive
 
@@ -435,18 +429,20 @@ sudo modprobe usbip_host
 sudo usbipd -D
 usbip list --local
 sudo usbip bind --busid 1-2
-remoteusb serve --backend 127.0.0.1:3240 --rendezvous 203.0.113.10:7443 --credentials ./exporter-credentials
+remoteusb serve --listen 0.0.0.0:7443 --credentials ./exporter-credentials
 ```
 
-Replace the relay IP and BUSID as above. If usbipd is already managed by a system
-service, use it instead of starting a second daemon. remoteusb stays foreground.
-On a Linux receiver, start `remoteusb connect` as above with
-`--credentials ./receiver-credentials`; in another terminal:
+Replace the exporter IP and BUSID as above. If usbipd is already managed by a
+system service, use it instead of starting a second daemon. Automatic attachment
+and its cleanup supervisor currently require Windows usbip-win2. On Linux, use
+native tools with a foreground plain tunnel:
 
 ```sh
+remoteusb list 203.0.113.10 --credentials ./receiver-credentials
+remoteusb connect 203.0.113.10 --listen 127.0.0.1:13240 --credentials ./receiver-credentials
+# In a second terminal:
 sudo modprobe vhci_hcd
-usbip list --remote 127.0.0.1
-sudo usbip attach --remote 127.0.0.1 --busid 1-2
+sudo usbip --tcp-port 13240 attach --remote 127.0.0.1 --busid 1-2
 usbip port
 # Replace 0 with the actual local imported port:
 sudo usbip detach --port 0
@@ -489,6 +485,17 @@ dismount/remount and readback. The test file was removed and the original device
 mount, sharing, and firewall state restored. This does not qualify physical
 relay attachment, YubiKey functions, or cross-machine Internet operation.
 Follow the driver setup and discovery/attach steps above to qualify your device.
+
+The direct-first CLI and independent supervisor were also exercised manually on
+Windows with usbipd-win 5.3.0 and usbip-win2 0.9.8.1: authenticated device discovery
+over direct TCP and forced relay, real YubiKey attachment, and cleanup after
+Ctrl-C, killing only the receiver, and exporter loss. Each cleanup left no imported
+devices; a nonexistent BUSID failed without retaining a cleanup worker. These were
+same-machine checks, not cross-machine Internet or YubiKey authentication-function
+qualification.
+An additional real-driver smoke killed the receiver while an import awaited its
+first reply from a deliberately stalled loopback backend; its supervisor closed
+the sockets and exited without creating a device or retaining a reservation.
 
 ## Opt-in real-drive integration test
 
@@ -547,9 +554,9 @@ isochronous devices, resets, and throughput can differ from local USB. Encryptio
 is not a hardware compatibility guarantee.
 
 **Stop application activity and flush/unmount or safely eject storage before
-disconnecting it.** Windows `connect --attach` detaches its owned port on Ctrl-C;
-otherwise detach with the receiving USB/IP tool before stopping the tunnel.
-Shutdown then closes Groupnet resources; it is
+disconnecting it.** Supervised Windows attachments close their owned connection
+when the receiver exits; manually attached devices require native-tool cleanup.
+Shutdown closes Groupnet resources; it is
 like unplugging a device, not a graceful filesystem unmount. Unexpected loss can
 interrupt authentication or lose data. After any broken stream/restart, inspect
 imported ports, detach stale attachments, and explicitly attach again. No silent
@@ -561,9 +568,9 @@ For failures, check:
    devices. No hardware or driver installation is performed by remoteusb.
 2. Exporter backend availability on loopback 3240 and independent raw-port isolation.
 3. Actual listener addresses and same-machine/wildcard port collisions.
-4. Reachability of the numeric rendezvous address, relay firewall/routing, matching
-   `network.key`, and the exact two allowed IDs. Use `--relay-only` on both ends to
-   separate direct-path/NAT problems from stream/authentication problems.
+4. Direct exporter address/port reachability, or optional rendezvous reachability,
+   matching `network.key`, and allowlisted node IDs. In rendezvous mode, use
+   `--relay-only` on both ends to separate NAT problems from authentication failures.
 5. Clock/certificate validity, CA, both-EKU `groupnet.peer` leaves, fixed role file
    names, key/certificate pairing, exact opposite public leaf pin, and key ACLs.
    Do not bypass certificate checks to work around errors.

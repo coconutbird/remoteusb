@@ -111,18 +111,23 @@ pub(super) fn initialize(out: &Path) -> io::Result<()> {
     println!("Public certificates: ca.pem, exporter.pem, receiver.pem");
     println!("Secrets: exporter.key, receiver.key, network.key (protect file access)");
     println!("The CA signing key was not saved. See README for restricted file distribution.");
-    println!("Next commands (replace RENDEZVOUS-IP with a reachable numeric IP):");
     println!(
-        "  remoteusb rendezvous --listen 0.0.0.0:7443 --credentials \"{}\"",
+        "Direct connection (replace EXPORTER-IP; receiver defaults to ./credentials beside its executable):"
+    );
+    println!(
+        "  remoteusb serve --listen 0.0.0.0:7443 --credentials \"{}\"",
         out.display()
     );
     println!(
-        "  remoteusb serve --backend 127.0.0.1:3240 --rendezvous RENDEZVOUS-IP:7443 --credentials \"{}\"",
+        "  remoteusb list EXPORTER-IP --credentials \"{}\"",
         out.display()
     );
     println!(
-        "  remoteusb connect --listen 127.0.0.1:3240 --rendezvous RENDEZVOUS-IP:7443 --credentials \"{}\"",
+        "  remoteusb attach EXPORTER-IP BUSID --credentials \"{}\"",
         out.display()
+    );
+    println!(
+        "Optional rendezvous: run `remoteusb rendezvous`, add --rendezvous IP:7443 to serve, and use `remoteusb attach exporter BUSID --rendezvous IP:7443`."
     );
     Ok(())
 }

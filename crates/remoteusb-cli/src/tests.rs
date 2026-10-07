@@ -101,7 +101,7 @@ fn init_creates_owner_only_directory_and_files() -> io::Result<()> {
 }
 
 #[test]
-fn endpoint_defaults_and_aliases_keep_fixed_certificate_roles() -> Result<(), clap::Error> {
+fn aliases_never_change_which_private_key_is_loaded() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::try_parse_from([
         "remoteusb",
         "serve",
@@ -113,72 +113,92 @@ fn endpoint_defaults_and_aliases_keep_fixed_certificate_roles() -> Result<(), cl
         "key-pc",
         "--peer-id",
         "work-pc",
-        "--candidate-bind",
-        "127.0.0.1:0",
-        "--candidate-bind",
-        "127.0.0.2:0",
-        "--relay-only",
     ])?;
     let Command::Serve(args) = cli.command else {
-        panic!("expected serve command");
+        panic!("expected serve");
     };
-    let config = args.common.peer_config(args.local_id, args.peer_id, true);
+    let config = args.common.config(args.peer_id, true, None)?;
     assert_eq!(config.local_id, "key-pc");
     assert_eq!(config.peer_id, "work-pc");
     assert!(config.cert.ends_with("exporter.pem"));
     assert!(config.key.ends_with("exporter.key"));
     assert!(config.peer_cert.ends_with("receiver.pem"));
-    assert_eq!(config.candidate_binds.len(), 2);
-    assert!(config.relay_only);
 
     let cli = Cli::try_parse_from([
         "remoteusb",
         "connect",
+        "key-pc",
         "--credentials",
         "identities",
         "--rendezvous",
         "127.0.0.1:7443",
+        "--local-id",
+        "work-pc",
     ])?;
     let Command::Connect(args) = cli.command else {
-        panic!("expected connect command");
+        panic!("expected connect");
     };
-    let config = args.common.peer_config(args.local_id, args.peer_id, false);
-    assert_eq!(config.local_id, "receiver");
-    assert_eq!(config.peer_id, "exporter");
+    let config = args.endpoint.config()?;
+    assert_eq!(config.local_id, "work-pc");
+    assert_eq!(config.peer_id, "key-pc");
     assert!(config.cert.ends_with("receiver.pem"));
+    assert!(config.key.ends_with("receiver.key"));
     assert!(config.peer_cert.ends_with("exporter.pem"));
-    assert_eq!(
-        config.candidate_binds,
-        vec!["0.0.0.0:0".parse().expect("literal address")]
-    );
-    assert!(!config.relay_only);
-    assert_eq!(config.limits.max_connections, 64);
-    assert_eq!(config.limits.connect_timeout.as_secs(), 10);
     Ok(())
 }
 
 #[test]
-fn cli_rejects_missing_rendezvous_zero_limits_and_legacy_flags() {
-    assert!(Cli::try_parse_from(["remoteusb", "serve", "--credentials", "identities"]).is_err());
+fn incompatible_modes_and_unbounded_limits_are_rejected() {
     for arguments in [
-        ["--max-connections", "0"],
-        ["--connect-timeout-secs", "0"],
-        ["--remote", "127.0.0.1:7443"],
-        ["--server-name", "groupnet.peer"],
-        ["--ca", "ca.pem"],
-        ["--insecure", "true"],
-    ] {
-        let mut command = vec![
-            "remoteusb",
-            "connect",
-            "--credentials",
-            "identities",
+        vec!["connect", "192.0.2.1", "--max-connections", "0"],
+        vec!["connect", "192.0.2.1", "--connect-timeout-secs", "0"],
+        vec!["connect", "192.0.2.1", "--relay-only"],
+        vec!["list", "192.0.2.1", "--candidate-bind", "127.0.0.1:0"],
+        vec![
+            "serve",
+            "--listen",
+            "0.0.0.0:7443",
             "--rendezvous",
-            "127.0.0.1:7443",
-        ];
+            "192.0.2.1:7443",
+        ],
+        vec![
+            "connect",
+            "exporter",
+            "--rendezvous",
+            "192.0.2.1:7443",
+            "--peer-id",
+            "other",
+        ],
+        vec!["connect", "192.0.2.1", "--usbip", "usbip.exe"],
+        vec!["connect", "192.0.2.1", "--insecure"],
+        vec!["detach", "1"],
+    ] {
+        let mut command = vec!["remoteusb"];
         command.extend(arguments);
         assert!(Cli::try_parse_from(command).is_err());
     }
+}
+
+#[test]
+fn direct_targets_are_concrete_unicast_addresses() -> io::Result<()> {
+    use super::args::direct_address;
+    assert_eq!(
+        direct_address("192.0.2.1")?,
+        "192.0.2.1:7443".parse().unwrap()
+    );
+    assert_eq!(direct_address("[::1]:9000")?, "[::1]:9000".parse().unwrap());
+    assert_eq!(direct_address("::1")?, "[::1]:7443".parse().unwrap());
+    for target in [
+        "0.0.0.0",
+        "::",
+        "255.255.255.255",
+        "224.0.0.1",
+        "192.0.2.1:0",
+        "exporter",
+    ] {
+        assert!(direct_address(target).is_err());
+    }
+    Ok(())
 }
 
 #[test]
