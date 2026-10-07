@@ -17,9 +17,9 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 use crate::config::PeerConfig;
 use crate::fabric::{Fabric, Link, closed, within};
 
-/// Exchanged inside pinned TLS before any USB/IP byte. Version 2 introduced
-/// large flow-control windows; earlier peers reject its segments.
-pub const PREAMBLE: &[u8; 12] = b"REMOTEUSB\0\0\x02";
+/// Exchanged inside pinned TLS before any USB/IP byte. Version 3 follows
+/// Groupnet's byte-credit tunnel format; earlier peers cannot interoperate.
+pub const PREAMBLE: &[u8; 12] = b"REMOTEUSB\0\0\x03";
 
 /// An authenticated end-to-end stream adapted to Tokio I/O.
 type Secure = Compat<TunneledStream>;

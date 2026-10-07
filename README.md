@@ -94,17 +94,22 @@ half-closes. Setup deadlines do not become device idle timeouts. No broken USB
 stream is silently reconnected. An attached receiver exits and requests cleanup
 when its device stream ends; a plain `connect` listener can serve multiple streams.
 
-Groupnet owns tunnel flow control: slow start over a bounded 64-segment window
-of 16 KiB segments, RFC 6298 retransmission timing, and receive limits that
-accept any peer segment size. remoteusb sets only its admission bounds and sizes
-every drop-on-full queue (router link and tunnel queues, TCP and punch outbound
-queues) to hold Groupnet's per-session packet queue for every admitted stream,
-so a full window is never dropped locally and mistaken for congestion. Earlier
-Groupnet defaults (16 KiB in flight, growing one 512-byte segment per round trip)
-plus local drops made Internet-latency storage practically unusable. Wire
-protocol version 2 marks the remoteusb change; **update both endpoints**. A
-version 1 peer cannot complete the TLS handshake with a version 2 peer and fails
-after the setup deadline.
+Groupnet owns tunnel flow control: byte-based receive credit, windows of up to
+16 MiB per direction drawn from a bounded node-wide memory budget, and
+delay-based congestion control that fills high-latency links without building a
+standing queue. remoteusb sets only its admission bounds (its memory budget grows
+with `--max-connections` so every session's guaranteed floor fits) and sizes every
+drop-on-full queue (router link queues, TCP and punch outbound queues) to hold
+Groupnet's per-session packet queue for every admitted stream.
+
+Measured against plain TCP through the same latency/bandwidth emulator: 20 ms and
+80 ms gigabit downloads reach 117 and 108 MB/s (TCP 120 and 108), 100 Mbit links
+run at line rate, and request latency matches TCP; a cold 80 ms gigabit upload
+reaches about 82 MB/s while its window ramps. Earlier releases capped a stream at
+16 KiB-1 MiB in flight (12 MB/s at 80 ms) or dropped segments locally.
+Wire protocol version 3 (Groupnet tunnel version 3) marks the current format;
+**update both endpoints**. Older peers cannot complete the TLS handshake with a
+version 3 peer and fail after the setup deadline.
 
 The workspace uses Rust 2024 and resolver 3. Dependency direction is
 `remoteusb-cli -> remoteusb-transport -> Groupnet`; existing USB/IP driver policy

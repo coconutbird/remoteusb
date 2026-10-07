@@ -167,7 +167,6 @@ impl Fabric {
                     // Unused coordination messages are bounded and never decoded
                     // by a membership engine or retained as replicated metadata.
                     message_queue: QueueCapacity::MIN,
-                    tunnel_queue: frames,
                     link_queue: frames,
                     ..RouterConfig::default()
                 })
